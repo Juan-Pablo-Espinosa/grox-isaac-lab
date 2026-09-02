@@ -1,0 +1,66 @@
+"""Standing checkpoint test for NOVA_LOWERBODY_V2 - PD-hold under gravity, fixed solver settings."""
+import logging
+logging.basicConfig(level=logging.DEBUG)
+logging.getLogger("isaaclab_visualizers").setLevel(logging.DEBUG)
+
+import argparse
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser()
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import torch
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation
+from isaaclab.sim import SimulationContext
+
+from isaaclab_assets.robots import NOVA_LOWERBODY_CFG
+
+sim_cfg = sim_utils.SimulationCfg(dt=1 / 240, device=args_cli.device)
+sim = SimulationContext(sim_cfg)
+sim.set_camera_view([2.0, 2.0, 1.2], [0.0, 0.0, 0.5])
+
+cfg = sim_utils.GroundPlaneCfg()
+cfg.func("/World/defaultGroundPlane", cfg)
+cfg = sim_utils.DomeLightCfg(intensity=3000.0)
+cfg.func("/World/Light", cfg)
+
+robot_cfg = NOVA_LOWERBODY_CFG.replace(prim_path="/World/envs/env_0/Robot")
+robot_cfg.init_state.pos = (0.0, 0.0, 0.82)  # small drop, close to resting height
+robot = Articulation(cfg=robot_cfg)
+
+sim.reset()
+
+default_joint_pos = robot.data.default_joint_pos.clone()
+
+print("=" * 80)
+print("PD-hold standing test, fixed solver settings. Watching 8s.")
+print("=" * 80)
+
+for step in range(1920):  # 8s at 240Hz
+    robot.set_joint_position_target(default_joint_pos)
+    robot.write_data_to_sim()
+    sim.step()
+    robot.update(sim_cfg.dt)
+
+    if step % 60 == 0:
+        pos = robot.data.root_pos_w[0]
+        quat = robot.data.root_quat_w[0]
+        lin_vel = robot.data.root_lin_vel_w[0]
+        print(
+            f"t={step * sim_cfg.dt:5.2f}s  "
+            f"height={pos[2].item():6.3f}m  "
+            f"quat={[round(q.item(), 3) for q in quat]}  "
+            f"lin_vel_mag={torch.norm(lin_vel).item():6.3f}"
+        )
+
+print("=" * 80)
+print("Test complete.")
+print("=" * 80)
+
+simulation_app.close()
