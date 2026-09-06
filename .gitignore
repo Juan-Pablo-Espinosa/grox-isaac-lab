@@ -85,6 +85,12 @@ _build
 
 # Dev-time files, generated stuff
 **/__*
+# ...but not Python package markers -- **/__* unintentionally also matches every
+# __init__.py in the repo (invisible on already-tracked files since `git check-ignore`
+# suppresses matches on indexed paths by default; `--no-index` shows the true match).
+# Confirmed this blocks staging __init__.py for brand-new packages (grox-nova-integration,
+# grade-4-standing-walking session).
+!**/__init__.py
 
 # Isaac Lab CI environments in native mode
 **/_isaaclab_install_ci_*
