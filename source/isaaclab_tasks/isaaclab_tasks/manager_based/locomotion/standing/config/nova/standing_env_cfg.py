@@ -167,6 +167,25 @@ class NovaStandingEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.observations.policy.height_scan = None
         self.curriculum.terrain_levels = None
 
+        # -- contact sensor: disabled for this grade. NOVA's USD authors each rigid
+        # body as a USD-prim CHILD of its kinematic parent (Hip_Base -> Hip_Pitch_Left
+        # -> Hip_Roll_Left -> ...), not as flat siblings. isaaclab.sim.schemas.
+        # activate_contact_sensors() (schemas.py:687-693) explicitly assumes rigid
+        # bodies are never nested inside one another ("nested rigid bodies are not
+        # allowed by SDK") and stops descending the tree at the first RigidBodyAPI
+        # match per branch -- so for NOVA it only ever tags the root body ("Hip_Base")
+        # with PhysxContactReportAPI, leaving the other 16 untagged. ContactSensor's
+        # own body-discovery walk is correctly recursive (verified: contact_sensor.py
+        # uses get_all_matching_child_prims, which does NOT stop at a match) -- it
+        # just has nothing to find beyond Hip_Base. This activation runs during scene
+        # spawn, before sim.reset(), which is before ANY EventTermCfg (even
+        # mode="startup") can run -- so there is no clean per-task workaround; a real
+        # fix means patching either core Isaac Lab (affects every robot) or the
+        # shared NOVA USD asset (affects every future grade). Deferred rather than
+        # rushed here since Grade 4's reward/termination design never references
+        # contact_forces. Revisit when a future grade actually needs foot contact.
+        self.scene.contact_forces = None
+
         # -- retarget the inherited EventsCfg's body_names="base" filters to NOVA's
         # actual root body name. base_com is wrapped in a PresetCfg (physx vs.
         # newton_mjwarp); the physx/default branch holds the real EventTerm on
