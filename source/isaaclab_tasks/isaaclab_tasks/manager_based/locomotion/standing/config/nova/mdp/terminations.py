@@ -9,10 +9,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
-from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.assets import Articulation
+
+# Deferred to TYPE_CHECKING -- see mdp/rewards.py for the full explanation (an eager
+# import here forces premature pxr resolution before Kit boots, causing a native crash).
+if TYPE_CHECKING:
+    from isaaclab.assets import Articulation
+    from isaaclab.envs import ManagerBasedRLEnv
 
 
 def bad_tilt(

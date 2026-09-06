@@ -14,10 +14,25 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
-from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.assets import Articulation
+
+# Deferred to TYPE_CHECKING (matching the working anymal_c/mdp/rewards.py precedent):
+# isaaclab.assets/isaaclab.envs use lazy __getattr__-based exports, so an eager,
+# module-level `from isaaclab.assets import Articulation` forces immediate resolution
+# of Articulation's real (pxr-touching) implementation at THIS module's import time.
+# Since this mdp module gets imported while parsing the env cfg -- before
+# SimulationApp/Kit has booted -- that premature pxr import caused a native
+# "free(): invalid pointer" crash during Kit startup (verified via py-spy crash
+# traceback + a control test: identical crash for Isaac-Standing-Nova-v0, none for
+# Isaac-Velocity-Flat-Anymal-C-v0, the only difference being this eager import).
+# Both names are used only as type annotations here; `from __future__ import
+# annotations` makes annotations lazy strings, so this changes zero runtime behavior.
+if TYPE_CHECKING:
+    from isaaclab.assets import Articulation
+    from isaaclab.envs import ManagerBasedRLEnv
 
 
 def upright_reward(
