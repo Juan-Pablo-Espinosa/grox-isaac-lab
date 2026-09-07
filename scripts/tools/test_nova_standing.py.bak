@@ -30,19 +30,13 @@ cfg.func("/World/defaultGroundPlane", cfg)
 cfg = sim_utils.DomeLightCfg(intensity=3000.0)
 cfg.func("/World/Light", cfg)
 
-robot_cfg = NOVA_LOWERBODY_CFG.replace(prim_path="/World/envs/env_0/Robot")
-robot_cfg.init_state.pos = (0.0, 0.0, 0.82)  # small drop, close to resting height
+robot_cfg = NOVA_LOWERBODY_CFG.replace(prim_path="/World/Robot")
+robot_cfg.init_state.pos = (0.0, 0.0, 0.78)  # small drop, close to resting height
 robot = Articulation(cfg=robot_cfg)
 
 sim.reset()
 
 default_joint_pos = robot.data.default_joint_pos.clone()
-
-# right after robot object is available, at the very first timestep
-body_names = robot.data.body_names
-body_heights = robot.data.body_pos_w[0, :, 2]  # z-coordinate, env 0
-for name, h in zip(body_names, body_heights):
-    print(f"{name:30s} z={h:.4f}")
 
 print("=" * 80)
 print("PD-hold standing test, fixed solver settings. Watching 8s.")
@@ -64,10 +58,6 @@ for step in range(1920):  # 8s at 240Hz
             f"quat={[round(q.item(), 3) for q in quat]}  "
             f"lin_vel_mag={torch.norm(lin_vel).item():6.3f}"
         )
-        # per-timestep, alongside your existing height/quat prints
-        applied_torque = robot.data.applied_torque[0, :12]  # first 12 = revolute joints, exclude 4 prismatic
-        torque_sq_sum = (applied_torque ** 2).sum().item()
-        print(f"  torque_sq_sum={torque_sq_sum:.2f}  max_single={applied_torque.abs().max().item():.2f}")
 
 print("=" * 80)
 print("Test complete.")
