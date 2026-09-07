@@ -150,12 +150,39 @@ class ActionsCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the standing task — see mdp/rewards.py for derivations."""
+    """Reward terms for the standing task — see mdp/rewards.py for derivations.
+
+    Ceiling is 40 (15 upright + 10 height + 3 effort + 2 acceleration + 7
+    velocity_xy + 3 velocity_yaw).
+    """
 
     upright_reward = RewTerm(func=mdp_rewards.upright_reward, weight=15.0)
     height_reward = RewTerm(func=mdp_rewards.height_reward, weight=10.0)
     effort_reward = RewTerm(func=mdp_rewards.effort_reward, weight=3.0)
     acceleration_reward = RewTerm(func=mdp_rewards.acceleration_reward, weight=2.0)
+
+    # Closes the reward gap that let the policy satisfy upright_reward/height_reward
+    # via controlled backward toppling + horizontal sliding rather than genuinely
+    # standing in place (JP caught this live: error_vel_xy ~3.3-3.8 m/s and
+    # error_vel_yaw ~2.0 rad/s, sustained and completely unpunished, for the entire
+    # first 1500-iteration run). mdp.track_lin_vel_xy_exp / track_ang_vel_z_exp
+    # (isaaclab.envs.mdp.rewards, re-exported here) already compute exactly this
+    # error against the base_velocity command -- pinned to all-zero ranges (see
+    # __post_init__ below), verified to genuinely stay zero for every env despite
+    # the inherited heading_command=True (its heading-error-driven override is
+    # torch.clip'd to ranges.ang_vel_z, which is (0.0, 0.0)) -- so these terms were
+    # simply missing from RewardsCfg, not broken. exp(-error^2/std^2) form, verified
+    # against isaaclab/envs/mdp/rewards.py source directly. std values are JP's
+    # conversion from k=1/std^2, anchored to the actual observed drift magnitude
+    # (xy~3.5 m/s, yaw~2.0 rad/s) targeting reward=0.05 there: std_xy=2.0222 (from
+    # k=0.24455), std_yaw=1.1555 (from k=0.748933) -- verified both land reward
+    # ~0.0500 at their anchors and ~0.95-0.98 for small natural sway (<0.25 units).
+    velocity_xy_reward = RewTerm(
+        func=mdp.track_lin_vel_xy_exp, weight=7.0, params={"command_name": "base_velocity", "std": 2.0222}
+    )
+    velocity_yaw_reward = RewTerm(
+        func=mdp.track_ang_vel_z_exp, weight=3.0, params={"command_name": "base_velocity", "std": 1.1555}
+    )
 
 
 @configclass
