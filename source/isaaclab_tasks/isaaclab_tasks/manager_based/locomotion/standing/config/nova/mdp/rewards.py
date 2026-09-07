@@ -193,10 +193,23 @@ def symmetry_reward(
     """Symmetry reward: exp(-k * symmetry_error), where symmetry_error sums a
     per-pair error term over the 6 L/R joint pairs, using the sign convention
     each pair actually requires for CORRECT symmetric standing to read as zero
-    error -- NOT a naive (torque_L - torque_R)^2 for every pair.
+    error -- NOT a naive (pos_L - pos_R)^2 for every pair.
+
+    Measures POSITION symmetry (asset.data.joint_pos), not torque. An earlier
+    torque-based version of this term (torque_L ~= -torque_R per pair) let the
+    policy find a degenerate solution: park Upperleg_Yaw_Left at its hard limit
+    (+0.79 rad, needs near-zero holding torque there) while Right sat elsewhere
+    entirely (+0.54 to +0.71, nowhere near the mirrored -0.79) -- torque
+    symmetry was satisfied (reward 0.97-0.9995 across 8 independent envs) while
+    the actual STANCE was grossly asymmetric (the "diva pose"). Confirmed via
+    direct FK mirror-image comparison on the converged checkpoint: 4 of 6 pairs
+    failed to match their own theoretical mirror image in real joint-position
+    space despite near-maximal torque-based reward. Position is the quantity
+    that actually needs to be symmetric for a symmetric-looking stance, so this
+    is what's now measured.
 
     preserve_order=True on asset_cfg: same reasoning as effort_reward -- pairing
-    torques[:, i] with a specific named joint below requires joint_ids to come
+    positions[:, i] with a specific named joint below requires joint_ids to come
     back in _REVOLUTE_JOINT_NAMES's order, which find_joints does not guarantee
     unless explicitly requested.
 
@@ -224,26 +237,22 @@ def symmetry_reward(
     even for an unmirrored raw axis vector. This is exactly why the convention
     was verified in simulation rather than read off the URDF by inspection.
 
-    k=0.002346 -- REAL, data-derived value. Solved so reward=0.5 at the real
-    symmetry_error p90 telemetry value (295.44 N*m^2) gathered from the
-    converged model_1550.pt checkpoint using this SAME corrected per-pair sign
-    convention (scripts/tools/gather_torque_telemetry.py). Verified:
-    exp(-0.002346*295.44) = 0.500. For comparison, the naive (all pairs
-    same-sign) version of this same telemetry measured p90=664.92 -- using the
-    wrong convention would have overstated the real asymmetry by ~2.5x for 4 of
-    the 6 pairs, since correct opposite-sign symmetric behavior (torque_L ~=
-    -torque_R) makes (torque_L - torque_R)^2 come out close to (2*torque_L)^2
-    instead of near zero.
+    k=1.4255 -- REAL, data-derived value for the POSITION-based symmetry_error
+    (rad^2). Solved so reward=0.05 at the real median degenerate-behavior
+    telemetry value (2.10150 rad^2) gathered from checkpoint model_2999.pt --
+    the exact "diva pose" run, dominated by Upperleg_Yaw_Left pinned at its
+    +0.79 rad hard limit (scripts/tools/gather_position_symmetry_telemetry.py).
+    Verified: exp(-1.4255*2.1015) = 0.0500.
     """
     asset: Articulation = env.scene[asset_cfg.name]
-    torques = asset.data.applied_torque[:, asset_cfg.joint_ids]
+    positions = asset.data.joint_pos[:, asset_cfg.joint_ids]
     # indices within this 12-joint slice, matching _REVOLUTE_JOINT_NAMES's order
-    hip_pitch_l, hip_pitch_r = torques[:, 0], torques[:, 1]
-    hip_roll_l, hip_roll_r = torques[:, 2], torques[:, 3]
-    upperleg_yaw_l, upperleg_yaw_r = torques[:, 4], torques[:, 5]
-    lowerleg_pitch_l, lowerleg_pitch_r = torques[:, 6], torques[:, 7]
-    feet_roll_l, feet_roll_r = torques[:, 8], torques[:, 9]
-    feet_pitch_l, feet_pitch_r = torques[:, 10], torques[:, 11]
+    hip_pitch_l, hip_pitch_r = positions[:, 0], positions[:, 1]
+    hip_roll_l, hip_roll_r = positions[:, 2], positions[:, 3]
+    upperleg_yaw_l, upperleg_yaw_r = positions[:, 4], positions[:, 5]
+    lowerleg_pitch_l, lowerleg_pitch_r = positions[:, 6], positions[:, 7]
+    feet_roll_l, feet_roll_r = positions[:, 8], positions[:, 9]
+    feet_pitch_l, feet_pitch_r = positions[:, 10], positions[:, 11]
 
     symmetry_error = (
         (hip_pitch_l + hip_pitch_r) ** 2  # opposite-sign
@@ -254,5 +263,5 @@ def symmetry_reward(
         + (feet_pitch_l - feet_pitch_r) ** 2  # same-sign
     )
 
-    k = 0.002346
+    k = 1.4255
     return torch.exp(-k * symmetry_error)

@@ -152,8 +152,8 @@ class ActionsCfg:
 class RewardsCfg:
     """Reward terms for the standing task — see mdp/rewards.py for derivations.
 
-    Ceiling is 42 (15 upright + 10 height + 3 effort + 2 acceleration + 7
-    velocity_xy + 3 velocity_yaw + 2 symmetry).
+    Ceiling is 46 (15 upright + 10 height + 3 effort + 2 acceleration + 7
+    velocity_xy + 3 velocity_yaw + 6 symmetry).
     """
 
     upright_reward = RewTerm(func=mdp_rewards.upright_reward, weight=15.0)
@@ -202,16 +202,31 @@ class RewardsCfg:
         func=mdp.track_ang_vel_z_exp, weight=3.0, params={"command_name": "base_velocity", "std": 1.1555}
     )
 
-    # Rewards L/R torque symmetry using the EMPIRICALLY VERIFIED per-pair sign
-    # convention (mdp/rewards.py's symmetry_reward docstring has the full
-    # derivation) -- 4 of 6 pairs are opposite-sign (Hip_Pitch, Hip_Roll,
+    # Rewards L/R POSITION symmetry (mdp/rewards.py's symmetry_reward docstring
+    # has the full derivation) using the EMPIRICALLY VERIFIED per-pair sign
+    # convention -- 4 of 6 pairs are opposite-sign (Hip_Pitch, Hip_Roll,
     # Upperleg_Yaw, Lowerleg_Pitch/the knee), only 2 are same-sign (Feet_Roll,
-    # Feet_Pitch). k=0.002346 anchored to the real symmetry_error p90 (295.44
-    # N*m^2, using this same corrected convention) from the converged
-    # model_1550.pt checkpoint, targeting reward=0.5 there.
+    # Feet_Pitch).
+    #
+    # Was previously torque-based with weight raised 2.0 -> 6.0 (the term
+    # itself climbed 0.0148 -> ~1.0), but this let the policy find a degenerate
+    # solution -- park Upperleg_Yaw_Left at its hard limit (near-zero holding
+    # torque there) while Right sat elsewhere entirely -- that scored
+    # near-maximal TORQUE symmetry while being grossly POSITION-asymmetric (the
+    # "diva pose", confirmed via direct FK mirror-image comparison: 4 of 6
+    # pairs failed to match their own theoretical mirror image). Redefined to
+    # measure joint_pos instead of applied_torque.
+    #
+    # k=1.4255 -- REAL, data-derived value for the new position-based
+    # symmetry_error (rad^2). Solved so reward=0.05 at the real median
+    # degenerate-behavior telemetry value (2.10150 rad^2) from the diva-pose
+    # checkpoint model_2999.pt (see mdp/rewards.py's symmetry_reward docstring
+    # for the full derivation). Weight held at 6.0 (unchanged from the
+    # torque-based version) deliberately, to isolate whether fixing the metric
+    # alone resolves the asymmetry before revisiting the weight.
     symmetry_reward = RewTerm(
         func=mdp_rewards.symmetry_reward,
-        weight=2.0,
+        weight=6.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_REVOLUTE_JOINTS, preserve_order=True)},
     )
 
