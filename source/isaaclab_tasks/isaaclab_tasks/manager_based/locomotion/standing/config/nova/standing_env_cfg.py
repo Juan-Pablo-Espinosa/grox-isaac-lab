@@ -5,23 +5,31 @@
 
 from __future__ import annotations
 
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+from isaaclab_physx.physics import PhysxCfg
+
 import isaaclab.envs.mdp as mdp
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ImuCfg
+from isaaclab.sim import SimulationCfg
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_assets.robots import NOVA_LOWERBODY_CFG
 
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
+    EventsCfg as BaseEventsCfg,
     LocomotionVelocityRoughEnvCfg,
     MySceneCfg,
     ObservationsCfg as BaseObservationsCfg,
 )
+from isaaclab_tasks.manager_based.locomotion.standing.config.nova.mdp import events as mdp_events
 from isaaclab_tasks.manager_based.locomotion.standing.config.nova.mdp import rewards as mdp_rewards
 from isaaclab_tasks.manager_based.locomotion.standing.config.nova.mdp import terminations as mdp_terminations
+from isaaclab_tasks.utils import PresetCfg
 
 # The 12 revolute joints — RL-controlled. The 4 prismatic (leg-length morphology)
 # joints are deliberately excluded: verified this session that with them out of the
@@ -52,6 +60,41 @@ NOVA_REVOLUTE_JOINTS = [
 # body_label dump this session) — NOT "base" (Anymal's convention, baked into the
 # inherited EventsCfg's body_names filters).
 NOVA_ROOT_BODY = "Hip_Base"
+
+
+##
+# Physics preset
+##
+
+
+@configclass
+class NovaStandingPhysicsCfg(PresetCfg):
+    """Flat-terrain physics preset, mirroring AnymalCFlatEnvCfg's PhysicsCfg exactly.
+
+    The inherited LocomotionVelocityRoughEnvCfg.sim uses RoughPhysicsCfg, tuned for
+    rough-terrain triangle-mesh contact (Newton branch: njmax=200, nconmax=100,
+    cone="pyramidal", impratio=1.0, plus a 1cm shape margin explicitly noted upstream
+    as "the single most important Newton setting for rough terrain"). Standing is a
+    flat-plane task with none of that complexity -- this mirrors the same swap
+    AnymalCFlatEnvCfg makes for its own flat variant.
+
+    Note: the actually-running backend for this task is PhysX (verified via startup
+    logs), and PhysxCfg here is byte-identical to RoughPhysicsCfg's PhysX branch
+    (gpu_max_rigid_patch_count=10*2**15 either way) -- so this swap changes nothing
+    for the current PhysX-backed training and does NOT by itself explain the measured
+    foot-penetration (see ground_rest_offset event below for the actual verified fix).
+    It's still the architecturally correct thing to do: it matches this repo's own
+    flat/rough convention, and matters the moment this task is ever run on the
+    newton_mjwarp backend.
+    """
+
+    default = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+    newton_mjwarp = NewtonCfg(
+        solver_cfg=MJWarpSolverCfg(njmax=120, nconmax=15, cone="elliptic", impratio=100, integrator="implicitfast"),
+        num_substeps=1,
+        debug_mode=False,
+    )
+    physx = default
 
 
 ##
@@ -124,6 +167,38 @@ class TerminationsCfg:
     bad_height = DoneTerm(func=mdp_terminations.bad_height)
 
 
+@configclass
+class EventsCfg(BaseEventsCfg):
+    """Adds startup events: ground rest_offset (foot-penetration fix) and the
+    real-hardware asymmetric knee joint limits (Issue 3).
+
+    Task-level, robot-config-untouched fixes -- see mdp/events.py for the full
+    root-cause writeups and scripts/tools/measure_foot_penetration.py for the
+    penetration measurement methodology.
+    """
+
+    ground_rest_offset = EventTerm(
+        func=mdp_events.set_ground_rest_offset,
+        mode="startup",
+        params={"prim_path": "/World/ground", "rest_offset": 0.003, "contact_offset": 0.005},
+    )
+
+    # Real hardware data: knees only bend one direction; left/right are mirrored.
+    # The prior [-2.090, 2.090] symmetric range was a known placeholder (flagged
+    # since Grade 3). Applied via write_joint_position_limit_to_sim_index at
+    # startup rather than touching the USD/URDF -- see mdp/events.py.
+    knee_joint_limits = EventTerm(
+        func=mdp_events.set_asymmetric_joint_pos_limits,
+        mode="startup",
+        params={
+            "limits": {
+                "Lowerleg_Pitch_Left_Joint": (0.0, 1.85),
+                "Lowerleg_Pitch_Right_Joint": (-1.85, 0.0),
+            }
+        },
+    )
+
+
 ##
 # Environment configuration
 ##
@@ -140,11 +215,13 @@ class NovaStandingEnvCfg(LocomotionVelocityRoughEnvCfg):
     rather than a rebuild.
     """
 
+    sim: SimulationCfg = SimulationCfg(physics=NovaStandingPhysicsCfg())
     scene: NovaStandingSceneCfg = NovaStandingSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    events: EventsCfg = EventsCfg()
 
     def __post_init__(self):
         # post init of parent
