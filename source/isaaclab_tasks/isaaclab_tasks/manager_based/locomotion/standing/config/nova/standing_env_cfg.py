@@ -152,14 +152,32 @@ class ActionsCfg:
 class RewardsCfg:
     """Reward terms for the standing task — see mdp/rewards.py for derivations.
 
-    Ceiling is 40 (15 upright + 10 height + 3 effort + 2 acceleration + 7
-    velocity_xy + 3 velocity_yaw).
+    Ceiling is 42 (15 upright + 10 height + 3 effort + 2 acceleration + 7
+    velocity_xy + 3 velocity_yaw + 2 symmetry).
     """
 
     upright_reward = RewTerm(func=mdp_rewards.upright_reward, weight=15.0)
     height_reward = RewTerm(func=mdp_rewards.height_reward, weight=10.0)
-    effort_reward = RewTerm(func=mdp_rewards.effort_reward, weight=3.0)
-    acceleration_reward = RewTerm(func=mdp_rewards.acceleration_reward, weight=2.0)
+
+    # asset_cfg passed explicitly via params for effort_reward/acceleration_reward/
+    # symmetry_reward (below) -- REQUIRED, not optional. The manager's own
+    # SceneEntityCfg-resolution pass only walks RewTermCfg.params, never a
+    # function's own default parameter value (verified this session: relying on
+    # the default left asset_cfg.joint_ids unresolved at slice(None), silently
+    # summing over all 16 joints -- including the 4 stiff prismatic ones -- instead
+    # of the intended 12 revolute joints, undetected until symmetry_reward's
+    # element-wise indexing raised a hard shape error against it; see
+    # mdp/rewards.py's module-level comment for the full writeup).
+    effort_reward = RewTerm(
+        func=mdp_rewards.effort_reward,
+        weight=3.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_REVOLUTE_JOINTS, preserve_order=True)},
+    )
+    acceleration_reward = RewTerm(
+        func=mdp_rewards.acceleration_reward,
+        weight=2.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_REVOLUTE_JOINTS, preserve_order=True)},
+    )
 
     # Closes the reward gap that let the policy satisfy upright_reward/height_reward
     # via controlled backward toppling + horizontal sliding rather than genuinely
@@ -182,6 +200,19 @@ class RewardsCfg:
     )
     velocity_yaw_reward = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=3.0, params={"command_name": "base_velocity", "std": 1.1555}
+    )
+
+    # Rewards L/R torque symmetry using the EMPIRICALLY VERIFIED per-pair sign
+    # convention (mdp/rewards.py's symmetry_reward docstring has the full
+    # derivation) -- 4 of 6 pairs are opposite-sign (Hip_Pitch, Hip_Roll,
+    # Upperleg_Yaw, Lowerleg_Pitch/the knee), only 2 are same-sign (Feet_Roll,
+    # Feet_Pitch). k=0.002346 anchored to the real symmetry_error p90 (295.44
+    # N*m^2, using this same corrected convention) from the converged
+    # model_1550.pt checkpoint, targeting reward=0.5 there.
+    symmetry_reward = RewTerm(
+        func=mdp_rewards.symmetry_reward,
+        weight=2.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_REVOLUTE_JOINTS, preserve_order=True)},
     )
 
 

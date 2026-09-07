@@ -73,46 +73,76 @@ def height_reward(
     return torch.exp(-k * (target_height - height) ** 2)
 
 
+# CRITICAL WIRING REQUIREMENT for effort_reward, acceleration_reward, and
+# symmetry_reward (any reward term below that reads asset_cfg.joint_ids): the
+# manager's own SceneEntityCfg-resolution pass ONLY walks RewTermCfg.params
+# (isaaclab/managers/manager_base.py:394-395, `for key, value in
+# term_cfg.params.items(): self._resolve_param_value(...)`) -- it does NOT
+# introspect function-signature DEFAULT parameter values. A RewTerm wired as
+# `RewTerm(func=effort_reward, weight=3.0)` with no explicit `params=` means
+# asset_cfg.resolve() is NEVER called; asset_cfg.joint_ids silently stays at its
+# unresolved slice(None) default (all 16 joints, prismatic included), while
+# asset_cfg.joint_names still shows the correct 12-name list (set directly by
+# the constructor, independent of resolve()) -- an easy-to-miss inconsistency.
+# Verified this exact failure mode this session: it doesn't crash a pure-sum
+# formula (sum over 16 vs 12 is still a valid op, just silently wrong, which is
+# why effort_reward/acceleration_reward carried this bug undetected until
+# symmetry_reward's element-wise per-pair indexing raised a hard shape error
+# against it). standing_env_cfg.py's RewardsCfg MUST pass
+# params={"asset_cfg": SceneEntityCfg(..., preserve_order=True)} explicitly for
+# all three of these terms -- relying on the function default is not enough.
+#
+# Verified per-joint effort_limit_sim [N*m] (source/isaaclab_assets/isaaclab_assets/
+# robots/nova.py's actuator groups), in the SAME order as the joint_names list
+# below -- used by both effort_reward and symmetry_reward.
+_REVOLUTE_JOINT_NAMES = [
+    "Hip_Pitch_Left_Joint", "Hip_Pitch_Right_Joint",
+    "Hip_Roll_Left_Joint", "Hip_Roll_Right_Joint",
+    "Upperleg_Yaw_Left_Joint", "Upperleg_Yaw_Right_Joint",
+    "Lowerleg_Pitch_Left_Joint", "Lowerleg_Pitch_Right_Joint",
+    "Feet_Roll_Left_Joint", "Feet_Roll_Right_Joint",
+    "Feet_Pitch_Left_Joint", "Feet_Pitch_Right_Joint",
+]
+_REVOLUTE_EFFORT_LIMITS = [120.0, 120.0, 60.0, 60.0, 60.0, 60.0, 120.0, 120.0, 34.0, 34.0, 34.0, 34.0]
+
+
 def effort_reward(
     env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=[
-        "Hip_Pitch_Left_Joint", "Hip_Pitch_Right_Joint",
-        "Hip_Roll_Left_Joint", "Hip_Roll_Right_Joint",
-        "Upperleg_Yaw_Left_Joint", "Upperleg_Yaw_Right_Joint",
-        "Lowerleg_Pitch_Left_Joint", "Lowerleg_Pitch_Right_Joint",
-        "Feet_Roll_Left_Joint", "Feet_Roll_Right_Joint",
-        "Feet_Pitch_Left_Joint", "Feet_Pitch_Right_Joint",
-    ]),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=_REVOLUTE_JOINT_NAMES, preserve_order=True),
 ) -> torch.Tensor:
-    """Effort reward: exp(-k * sum(torque^2)) over the 12 revolute joints only.
+    """Effort reward: exp(-k * sum((torque_i/limit_i)^2)) over the 12 revolute
+    joints, normalized by each joint's own effort_limit_sim (percentage-of-max,
+    not raw N*m) -- so joints with very different torque budgets (Feet: 34 N*m
+    vs Hip_Pitch/Lowerleg_Pitch: 120 N*m) are penalized on a comparable scale.
+
+    preserve_order=True on asset_cfg: SceneEntityCfg.resolve() calls
+    Articulation.find_joints(..., preserve_order=self.preserve_order), default
+    False -- without this, joint_ids could come back reordered relative to
+    _REVOLUTE_EFFORT_LIMITS's index-matched order, silently pairing the wrong
+    joint with the wrong limit. Verified this exact risk this session while
+    building the offline telemetry script (scripts/tools/gather_torque_telemetry.py).
 
     Prismatic joints excluded — they are morphology-control, not policy-controlled
     (established design decision, Grade 3/4).
 
-    k=0.000159 -- PROVISIONAL. Analytically anchored to ~33 N*m single-leg support
-    estimate (both legs -> torque_sq ~2178), targeting reward=0.5 there, then HALVED
-    per JP's explicit request for a conservative/lenient starting bias. Not yet
-    verified against real active-balancing telemetry (no trained policy exists yet).
-    Revisit after first training run with real effort data.
+    k=5.1782 -- REAL, data-derived value (was k=0.000159 on raw torque_sq_sum, an
+    analytical guess). Solved so reward=0.5 at the real percentage_torque_sq_sum
+    p90 telemetry value (0.13386) gathered from the converged model_1550.pt
+    checkpoint (scripts/tools/gather_torque_telemetry.py). Verified:
+    exp(-5.1782*0.13386) = 0.500.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     torques = asset.data.applied_torque[:, asset_cfg.joint_ids]
-    torque_sq_sum = torch.sum(torques**2, dim=1)
+    limits = torch.tensor(_REVOLUTE_EFFORT_LIMITS, dtype=torques.dtype, device=torques.device)
+    pct_sq_sum = torch.sum((torques / limits) ** 2, dim=1)
 
-    k = 0.000159  # solved for 0.5 reward at anchor (2178), then halved for conservative margin
-    return torch.exp(-k * torque_sq_sum)
+    k = 5.1782
+    return torch.exp(-k * pct_sq_sum)
 
 
 def acceleration_reward(
     env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=[
-        "Hip_Pitch_Left_Joint", "Hip_Pitch_Right_Joint",
-        "Hip_Roll_Left_Joint", "Hip_Roll_Right_Joint",
-        "Upperleg_Yaw_Left_Joint", "Upperleg_Yaw_Right_Joint",
-        "Lowerleg_Pitch_Left_Joint", "Lowerleg_Pitch_Right_Joint",
-        "Feet_Roll_Left_Joint", "Feet_Roll_Right_Joint",
-        "Feet_Pitch_Left_Joint", "Feet_Pitch_Right_Joint",
-    ]),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=_REVOLUTE_JOINT_NAMES),
 ) -> torch.Tensor:
     """Acceleration reward: exp(-k * sum(joint_acc^2)) over the 12 revolute joints.
 
@@ -154,3 +184,75 @@ def acceleration_reward(
 
     k = 0.0000189
     return torch.exp(-k * accel_sq_sum)
+
+
+def symmetry_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=_REVOLUTE_JOINT_NAMES, preserve_order=True),
+) -> torch.Tensor:
+    """Symmetry reward: exp(-k * symmetry_error), where symmetry_error sums a
+    per-pair error term over the 6 L/R joint pairs, using the sign convention
+    each pair actually requires for CORRECT symmetric standing to read as zero
+    error -- NOT a naive (torque_L - torque_R)^2 for every pair.
+
+    preserve_order=True on asset_cfg: same reasoning as effort_reward -- pairing
+    torques[:, i] with a specific named joint below requires joint_ids to come
+    back in _REVOLUTE_JOINT_NAMES's order, which find_joints does not guarantee
+    unless explicitly requested.
+
+    Sign convention was NOT guessed from joint names or from position-limit
+    asymmetry alone (the knee's [0,1.85]/[-1.85,0] limits are suggestive but not
+    proof by themselves). It was verified empirically via forward kinematics
+    (scripts/tools/verify_pair_sign_convention.py): perturb one joint at a time
+    (all others held at 0, gravity off), then check whether Right(+theta) or
+    Right(-theta) reproduces the true Y-mirror-image of Left(+theta)'s resulting
+    body position. Also confirmed the "nominal pose" sanity check the process
+    started with is degenerate for this robot: default_joint_pos is exactly 0.0
+    for all 16 joints (verified via scripts/tools/check_default_joint_pos.py), so
+    pos_L-pos_R=0 and pos_L+pos_R=0 both hold trivially there regardless of which
+    convention is correct -- it has zero discriminating power, which is why the
+    FK-perturbation test was used instead.
+
+    Verified result: 4 of 6 pairs are opposite-sign (physically symmetric
+    standing means torque_L ~= -torque_R), not just the knee as originally
+    suspected -- Hip_Pitch, Hip_Roll, Upperleg_Yaw, and Lowerleg_Pitch are all
+    opposite-sign; only Feet_Roll and Feet_Pitch are same-sign. Notably this is
+    NOT simply "does the raw axis vector's Y-component flip between sides":
+    Hip_Roll's axis is (1,0,0), IDENTICAL and unmirrored on both sides in the
+    URDF, yet it is still empirically opposite-sign -- mirroring a body is an
+    orientation-reversing transform, which can flip the effective rotation sign
+    even for an unmirrored raw axis vector. This is exactly why the convention
+    was verified in simulation rather than read off the URDF by inspection.
+
+    k=0.002346 -- REAL, data-derived value. Solved so reward=0.5 at the real
+    symmetry_error p90 telemetry value (295.44 N*m^2) gathered from the
+    converged model_1550.pt checkpoint using this SAME corrected per-pair sign
+    convention (scripts/tools/gather_torque_telemetry.py). Verified:
+    exp(-0.002346*295.44) = 0.500. For comparison, the naive (all pairs
+    same-sign) version of this same telemetry measured p90=664.92 -- using the
+    wrong convention would have overstated the real asymmetry by ~2.5x for 4 of
+    the 6 pairs, since correct opposite-sign symmetric behavior (torque_L ~=
+    -torque_R) makes (torque_L - torque_R)^2 come out close to (2*torque_L)^2
+    instead of near zero.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    torques = asset.data.applied_torque[:, asset_cfg.joint_ids]
+    # indices within this 12-joint slice, matching _REVOLUTE_JOINT_NAMES's order
+    hip_pitch_l, hip_pitch_r = torques[:, 0], torques[:, 1]
+    hip_roll_l, hip_roll_r = torques[:, 2], torques[:, 3]
+    upperleg_yaw_l, upperleg_yaw_r = torques[:, 4], torques[:, 5]
+    lowerleg_pitch_l, lowerleg_pitch_r = torques[:, 6], torques[:, 7]
+    feet_roll_l, feet_roll_r = torques[:, 8], torques[:, 9]
+    feet_pitch_l, feet_pitch_r = torques[:, 10], torques[:, 11]
+
+    symmetry_error = (
+        (hip_pitch_l + hip_pitch_r) ** 2  # opposite-sign
+        + (hip_roll_l + hip_roll_r) ** 2  # opposite-sign
+        + (upperleg_yaw_l + upperleg_yaw_r) ** 2  # opposite-sign
+        + (lowerleg_pitch_l + lowerleg_pitch_r) ** 2  # opposite-sign (the knee)
+        + (feet_roll_l - feet_roll_r) ** 2  # same-sign
+        + (feet_pitch_l - feet_pitch_r) ** 2  # same-sign
+    )
+
+    k = 0.002346
+    return torch.exp(-k * symmetry_error)
