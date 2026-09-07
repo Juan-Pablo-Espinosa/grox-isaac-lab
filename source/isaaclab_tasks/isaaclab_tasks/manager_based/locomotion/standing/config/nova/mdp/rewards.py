@@ -116,14 +116,41 @@ def acceleration_reward(
 ) -> torch.Tensor:
     """Acceleration reward: exp(-k * sum(joint_acc^2)) over the 12 revolute joints.
 
-    k=0.000866 -- PROVISIONAL, weakest-verified term this session. Anchored to a
-    rough 10 rad/s^2-per-joint guess (no real spec exists for joint accel limits,
-    unlike velocity which has real limits in the joint table). Revisit after first
-    training run.
+    k=0.0000189 -- REAL, data-derived value (was k=0.000866, an analytical guess
+    anchored to a rough ~10 rad/s^2-per-joint estimate that turned out to be off by
+    ~4 orders of magnitude, which is why the reward logged exactly 0.0000 every
+    iteration of the first 1500-iteration run: exp(-k*accel_sq_sum) was underflowing
+    to bit-exact 0.0 in float32 almost every step).
+
+    Derived from real accel_sq_sum telemetry gathered from the trained
+    model_1499.pt checkpoint (384,000 samples, 256 envs x 1500 steps, real policy
+    actions -- see scripts/tools/gather_accel_telemetry.py). Anchored to the
+    STABLE-regime (up_z>0.97, |height-target|<0.03, post-settling) median of
+    11,819.69, targeting reward=0.8 there (verified: exp(-0.0000189*11819.69) =
+    0.7998; k=0.0000189 supplied by JP, applied as given -- not re-derived here).
+    Full STABLE-regime percentiles for reference: p10=2,391, median=11,820,
+    p90=112,971, p99=1,292,975.
+
+    The extreme tail (p99 and beyond, up to ~2e8 in the full dataset) was
+    investigated separately (scripts/tools/investigate_accel_tail.py) and found to
+    be dominated almost exclusively by Feet_Roll_{Left,Right} -- confirmed via
+    per-body mass query (scripts/tools/check_foot_inertia.py) to be a near-massless
+    link (0.048kg, ~100x lighter than every neighboring body in the chain). Not a
+    ground-contact artifact (foot height stayed well clear of ground at every
+    top-8 spike this session observed); joint_acc's finite-difference computation
+    itself is correct (verified via isaaclab_physx articulation_data.py -- it's
+    recomputed every physics substep at dt=0.005s, not a coarse control-step
+    average), but the underlying joint_vel signal for this specific low-inertia
+    body is itself noisy (violent substep-to-substep sign flips, one observed
+    event exceeding the joint's own velocity_limit_sim=15 rad/s by ~70%) --
+    genuinely tiny torques on a near-massless body produce huge but momentary
+    angular accelerations. Flagged for awareness if joint_acc is ever used in an
+    observation rather than just this reward penalty; does not affect the STABLE-
+    regime median this k is anchored to.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     joint_acc = asset.data.joint_acc[:, asset_cfg.joint_ids]
     accel_sq_sum = torch.sum(joint_acc**2, dim=1)
 
-    k = 0.000866
+    k = 0.0000189
     return torch.exp(-k * accel_sq_sum)
