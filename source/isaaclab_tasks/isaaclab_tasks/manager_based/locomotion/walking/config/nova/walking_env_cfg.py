@@ -81,6 +81,7 @@ NOVA_H0 = 0.78822
 NOVA_K_UP = 0.99671
 NOVA_K_LOW = 0.97613
 NOVA_SPAWN_CLEARANCE = 0.01
+NOVA_EFFORT_K = 0.0693  # ln(2) / 10.0013, see RewardsCfg.effort_reward
 NOVA_DEFAULT_HEIGHT = NOVA_H0 + (NOVA_K_UP + NOVA_K_LOW) * 0.05  # 0.88686 m
 
 ##
@@ -209,7 +210,21 @@ class RewardsCfg:
         func=mdp.track_ang_vel_z_exp, weight=3.0, params={"command_name": "base_velocity", "std": 0.5}
     )
     # 12 revolute joints only, limits read from the walking actuator groups at runtime.
-    effort_reward = RewTerm(func=walking_rewards.effort_reward, weight=3.0, params={"asset_cfg": _REVOLUTE})
+    # k = ln(2)/S50, S50 = 10.0013 = p50 of sum (tau/tau_lim)^2 in a deterministic 20 s rollout of run 1
+    # (model_8250, 0.5 m/s), so that median earns 0.5 (p90 10.10 -> 0.497; zero-action stand p90 0.288 -> 0.980).
+    # The old k = 5.1782 (fit on standing telemetry) gave 3e-23 there, i.e. a dead term with no gradient.
+    # NOTE: run 1's gait was saturated bang-bang (hip roll / yaw / feet at ~100% of their limits), so this anchor is
+    # a very permissive one.
+    effort_reward = RewTerm(
+        func=walking_rewards.effort_reward, weight=3.0, params={"asset_cfg": _REVOLUTE, "k": NOVA_EFFORT_K}
+    )
+    # Stock H1 joint_deviation_hip (joint_deviation_l1 on hip yaw + roll, weight -0.2 vs a lin-vel tracking weight of
+    # 1.0; G1 uses -0.1) scaled by our 7x tracking weight: -0.2 * 7 = -1.4. Targets run 1's splay exploit.
+    joint_deviation_hip = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-1.4,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["Hip_Roll_.*", "Upperleg_Yaw_.*"])},
+    )
     # TODO: k=0.0000189 was fitted on standing telemetry; recalibrate the anchor on walking telemetry.
     acceleration_reward = RewTerm(
         func=standing_rewards.acceleration_reward, weight=2.0, params={"asset_cfg": _REVOLUTE}
@@ -239,20 +254,45 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=NOVA_FOOT_BODIES),
         },
     )
+    # Built but OFF (weight 0 = not evaluated by the RewardManager).
+    # TODO: enable after run 2 if the policy still exploits a low base or tilted feet.
+    height_tracking_reward = RewTerm(
+        func=walking_rewards.height_tracking_reward,
+        weight=0.0,
+        params={
+            "height_model": (NOVA_H0, NOVA_K_UP, NOVA_K_LOW),
+            "upper_prismatic_cfg": SceneEntityCfg("robot", joint_names=["Upperleg_Prismatic_.*"]),
+            "lower_prismatic_cfg": SceneEntityCfg("robot", joint_names=["Lowerleg_Prismatic_.*"]),
+            "sigma": 0.05,
+        },
+    )
+    foot_flat_reward = RewTerm(
+        func=walking_rewards.foot_flat_reward,
+        weight=0.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=NOVA_FOOT_BODIES, preserve_order=True),
+            "asset_cfg": SceneEntityCfg("robot", body_names=NOVA_FOOT_BODIES, preserve_order=True),
+            "sigma": 0.1,
+        },
+    )
 
 
 @configclass
 class TerminationsCfg:
-    """time_out, bad_tilt (unchanged), and illegal contact of non-foot bodies with anything."""
+    """time_out, bad_tilt (unchanged), a fixed height floor, and illegal contact of any non-foot body."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     bad_tilt = DoneTerm(func=standing_terminations.bad_tilt)
+    # Fixed floor (not leg-length dependent): 0.47 m ~= 0.6 * H0 (H0 = 0.788 m, shortest-leg standing height).
+    # World-frame root z, valid on the flat plane.
+    base_height = DoneTerm(func=mdp.root_height_below_minimum, params={"minimum_height": 0.47})
+    # All 13 non-foot bodies (everything except Feet_Roll_* / Feet_Pitch_*), 5 N.
     base_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
-                body_names=["Hip_Base", "Upperleg_Yaw_.*", "Upperleg_Prismatic_.*", "Lowerleg_Pitch_.*"],
+                body_names=["Hip_Base", "Hip_Pitch_.*", "Hip_Roll_.*", "Upperleg_.*", "Lowerleg_.*"],
             ),
             "threshold": 5.0,
         },

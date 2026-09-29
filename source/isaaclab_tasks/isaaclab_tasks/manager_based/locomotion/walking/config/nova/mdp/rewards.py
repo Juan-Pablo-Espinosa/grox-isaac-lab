@@ -25,26 +25,23 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def effort_reward(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-) -> torch.Tensor:
-    """exp(-k * sum_j (tau_j / tau_limit_j)^2) over the joints in ``asset_cfg``.
-
-    Same %-of-own-limit formula and k=5.1782 as the standing task's effort_reward, but the limits are
-    read at runtime from ``robot.data.joint_effort_limits`` (i.e. the walking actuator groups'
-    effort_limit_sim: 120/120/60/36/32 N·m) instead of a hard-coded list, so they cannot drift from the
-    actuator config. Pass the 12 revolute joints only -- prismatics are deliberately excluded.
-
-    TODO: k was fitted on standing telemetry (p90 of pct_sq_sum=0.13386 -> reward 0.5); recalibrate on walking.
-    """
+def effort_sum_ratio_sq(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """sum_j (tau_j / tau_limit_j)^2 over the joints in ``asset_cfg`` (limits read from the actuators)."""
     asset: Articulation = env.scene[asset_cfg.name]
     torques = asset.data.applied_torque.torch[:, asset_cfg.joint_ids]
     limits = asset.data.joint_effort_limits.torch[:, asset_cfg.joint_ids]
-    pct_sq_sum = torch.sum((torques / limits) ** 2, dim=1)
+    return torch.sum((torques / limits) ** 2, dim=1)
 
-    k = 5.1782
-    return torch.exp(-k * pct_sq_sum)
+
+def effort_reward(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, k: float) -> torch.Tensor:
+    """exp(-k * sum_j (tau_j / tau_limit_j)^2) over the joints in ``asset_cfg``.
+
+    Same %-of-own-limit formula as the standing task's effort_reward, but the limits are read at runtime from
+    ``robot.data.joint_effort_limits`` (the walking actuator groups' effort_limit_sim: 120/60/36/32 N·m) instead
+    of a hard-coded list. Pass the 12 revolute joints only -- prismatics are deliberately excluded. ``k`` is set
+    in the task cfg (see the calibration note there).
+    """
+    return torch.exp(-k * effort_sum_ratio_sq(env, asset_cfg))
 
 
 def prismatic_power_reward(
@@ -67,3 +64,49 @@ def prismatic_power_reward(
     force = asset.data.applied_torque.torch[:, asset_cfg.joint_ids]
     target_rate = env.action_manager.get_term(action_term_name).target_rate
     return torch.sum(torch.abs(force * target_rate), dim=1)
+
+
+def height_tracking_reward(
+    env: ManagerBasedRLEnv,
+    height_model: tuple[float, float, float],
+    upper_prismatic_cfg: SceneEntityCfg,
+    lower_prismatic_cfg: SceneEntityCfg,
+    sigma: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """exp(-(z - H(q))^2 / sigma^2): Hip_Base height vs the leg-length-dependent standing height.
+
+    H(q) = H0 + k_up * q_up + k_low * q_low with ``height_model = (H0, k_up, k_low)`` (FK fit at the default revolute
+    pose), q_up / q_low the L/R-averaged upper / lower prismatic positions [m]; z is the root height above the env
+    origin [m]; ``sigma`` [m].
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    q = asset.data.joint_pos.torch
+    q_up = q[:, upper_prismatic_cfg.joint_ids].mean(dim=1)
+    q_low = q[:, lower_prismatic_cfg.joint_ids].mean(dim=1)
+    h0, k_up, k_low = height_model
+    target = h0 + k_up * q_up + k_low * q_low
+    z = asset.data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
+    return torch.exp(-((z - target) ** 2) / sigma**2)
+
+
+def foot_flat_reward(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    sigma: float = 0.1,
+) -> torch.Tensor:
+    """Stance-only foot flatness: sum over feet in contact of exp(-tilt^2 / sigma^2), in [0, number of feet].
+
+    tilt [rad] is the angle between the foot sole normal and world Z. The sole normal is the foot body's local +Z
+    axis (at the all-zero joint pose the soles are exactly flat with the foot frames world-aligned). Feet in the air
+    contribute 0. ``asset_cfg.body_ids`` and ``sensor_cfg.body_ids`` must list the same feet in the same order.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    sensor = env.scene.sensors[sensor_cfg.name]
+    quat = asset.data.body_link_quat_w.torch[:, asset_cfg.body_ids]  # (N, F, 4) x,y,z,w
+    x, y = quat[..., 0], quat[..., 1]
+    n_z = 1.0 - 2.0 * (x**2 + y**2)  # world-Z component of the body +Z axis
+    tilt = torch.acos(n_z.clamp(-1.0, 1.0))
+    in_contact = sensor.data.current_contact_time.torch[:, sensor_cfg.body_ids] > 0.0
+    return torch.sum(in_contact.float() * torch.exp(-(tilt**2) / sigma**2), dim=1)

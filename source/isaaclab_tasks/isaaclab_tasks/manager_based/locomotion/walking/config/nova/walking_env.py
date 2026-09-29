@@ -19,6 +19,8 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.common import VecEnvStepReturn
 
+from .mdp.rewards import effort_sum_ratio_sq
+
 
 class NovaWalkingEnv(ManagerBasedRLEnv):
     """ManagerBasedRLEnv that logs per-step leg-length and command statistics."""
@@ -32,6 +34,12 @@ class NovaWalkingEnv(ManagerBasedRLEnv):
         log = dict(extras.get("log", {}))
         log["Metrics/prismatic_upper_q_mean"] = q[:, 0:2].mean()
         log["Metrics/prismatic_lower_q_mean"] = q[:, 2:4].mean()
+        # spread of the (L/R-averaged) leg lengths across envs
+        log["Metrics/prismatic_upper_q_std"] = q[:, 0:2].mean(dim=1).std()
+        log["Metrics/prismatic_lower_q_std"] = q[:, 2:4].mean(dim=1).std()
+        # raw effort, visible even when effort_reward saturates at 0 or 1
+        effort_cfg = self.reward_manager.get_term_cfg("effort_reward").params["asset_cfg"]
+        log["Metrics/effort_sum_ratio_sq_mean"] = effort_sum_ratio_sq(self, effort_cfg).mean()
         log["Metrics/prismatic_target_rate_abs_mean"] = prismatic_term.target_rate.abs().mean()
         log["Metrics/command_planar_speed_mean"] = torch.linalg.norm(cmd[:, :2], dim=1).mean()
         extras["log"] = log
