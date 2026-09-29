@@ -89,7 +89,11 @@ NOVA_DEFAULT_HEIGHT = NOVA_H0 + (NOVA_K_UP + NOVA_K_LOW) * 0.05  # 0.88817 m
 # all stable. 3e5 is the lowest k with sag < 0.5 mm. Damping keeps the previous grade's damping RATIO:
 # d = 100 * sqrt(k / 1e4) (k=1e4 -> d=100).
 NOVA_PRISMATIC_STIFFNESS = 3.0e5
-# PhysX joint velocity cap for the prismatics. NOT the leadscrew speed limit -- that (0.015 m/s) is enforced on the
+# Leadscrew hardware: T12x8 4-start trapezoidal screw (8 mm lead, bronze nut) driven directly by a RobStride 00
+# (10:1, 5 N·m rated / 14 N·m peak, 315 rpm no-load): ~0.035-0.041 m/s at walking loads, ~2270 N continuous.
+NOVA_PRISMATIC_MAX_SPEED = 0.035
+NOVA_PRISMATIC_EFFORT_LIMIT = 2250.0
+# PhysX joint velocity cap for the prismatics. NOT the leadscrew speed limit -- that is enforced on the
 # position target by PrismaticVelocityAction. Measured: with velocity_limit_sim=0.015 the PhysX maxJointVelocity
 # clamp lets body weight backdrive the lower prismatics continuously at exactly -0.015 m/s (q 0.048 -> 0.029 m in
 # <1 s, sag grew WITH stiffness to 11/32/42 mm) -- the opposite of a non-backdrivable leadscrew. With the cap at
@@ -103,40 +107,55 @@ def prismatic_damping(stiffness: float) -> float:
     return 100.0 * math.sqrt(stiffness / 1.0e4)
 
 
+# Revolute gains are SIM-ONLY (hardware gains unknown). Lowest per-group kp for which 64 envs at the exact default
+# pose, zero action, zero root reset velocity all stay up for 5 s (0 bad_tilt / illegal_contact), found by a
+# per-group descent from kp=2000 and a combined check (the per-group minima 50/25/25/150 together failed 56/64;
+# one ladder step up passes 64/64, twice). kd = 2*sqrt(kp*I_eff) (damping ratio 1), I_eff = diagonal of the
+# floating-base joint-space mass matrix at the default pose [kg*m^2]: Hip_Pitch 1.085, Lowerleg_Pitch 0.166,
+# Hip_Roll 1.246, Upperleg_Yaw 0.0335, Feet_Roll 0.00084, Feet_Pitch 0.00334.
+NOVA_REVOLUTE_GAINS = {
+    "hip_pitch_knee": (75.0, {"Hip_Pitch_.*": 18.04, "Lowerleg_Pitch_.*": 7.05}),
+    "hip_roll": (35.0, 13.21),
+    "upperleg_yaw": (35.0, 2.17),
+    "feet": (200.0, {"Feet_Roll_.*": 0.82, "Feet_Pitch_.*": 1.63}),
+}
+
+
 def nova_walking_actuators(prismatic_stiffness: float = NOVA_PRISMATIC_STIFFNESS) -> dict[str, ImplicitActuatorCfg]:
-    """Actuator groups split by effort limit; revolute kp/kd unchanged from nova.py (25 / 0.5)."""
+    """Actuator groups split by effort limit [N·m / N], with the sim-only revolute gains above."""
+    g = NOVA_REVOLUTE_GAINS
     return {
         "hip_pitch_knee": ImplicitActuatorCfg(
             joint_names_expr=["Hip_Pitch_.*", "Lowerleg_Pitch_.*"],
             effort_limit_sim=120.0,
             velocity_limit_sim=20.0,
-            stiffness=25.0,
-            damping=0.5,
+            stiffness=g["hip_pitch_knee"][0],
+            damping=g["hip_pitch_knee"][1],
         ),
         "hip_roll": ImplicitActuatorCfg(
             joint_names_expr=["Hip_Roll_.*"],
             effort_limit_sim=60.0,
             velocity_limit_sim=20.0,
-            stiffness=25.0,
-            damping=0.5,
+            stiffness=g["hip_roll"][0],
+            damping=g["hip_roll"][1],
         ),
         "upperleg_yaw": ImplicitActuatorCfg(
             joint_names_expr=["Upperleg_Yaw_.*"],
             effort_limit_sim=36.0,
             velocity_limit_sim=20.0,
-            stiffness=25.0,
-            damping=0.5,
+            stiffness=g["upperleg_yaw"][0],
+            damping=g["upperleg_yaw"][1],
         ),
         "feet": ImplicitActuatorCfg(
             joint_names_expr=["Feet_Roll_.*", "Feet_Pitch_.*"],
             effort_limit_sim=32.0,
             velocity_limit_sim=15.0,
-            stiffness=25.0,
-            damping=0.5,
+            stiffness=g["feet"][0],
+            damping=g["feet"][1],
         ),
         "leg_length": ImplicitActuatorCfg(
             joint_names_expr=["Upperleg_Prismatic_.*", "Lowerleg_Prismatic_.*"],
-            effort_limit_sim=500.0,
+            effort_limit_sim=NOVA_PRISMATIC_EFFORT_LIMIT,
             velocity_limit_sim=NOVA_PRISMATIC_SIM_VELOCITY_LIMIT,
             stiffness=prismatic_stiffness,
             damping=prismatic_damping(prismatic_stiffness),
@@ -161,7 +180,11 @@ class ActionsCfg:
         asset_name="robot", joint_names=NOVA_REVOLUTE_JOINTS, scale=0.25, use_default_offset=True
     )
     prismatic_vel = PrismaticVelocityActionCfg(
-        asset_name="robot", joint_names=NOVA_PRISMATIC_JOINTS, max_velocity=0.015, q_min=0.005, q_max=0.095
+        asset_name="robot",
+        joint_names=NOVA_PRISMATIC_JOINTS,
+        max_velocity=NOVA_PRISMATIC_MAX_SPEED,
+        q_min=0.005,
+        q_max=0.095,
     )
 
 
@@ -173,13 +196,13 @@ class RewardsCfg:
     """Walking rewards. Weight-0 terms are wired and logged but not yet shaping (calibrate from telemetry)."""
 
     upright_reward = RewTerm(func=standing_rewards.upright_reward, weight=15.0)
-    # Same functions / std as standing. They already track env.command_manager.get_command("base_velocity");
-    # standing only made them "zero-target" by pinning the command ranges to 0.
+    # Same functions as standing (they already track env.command_manager.get_command("base_velocity")); std
+    # tightened from standing's drift-penalty values (2.0222 m/s, 1.1555 rad/s) to 0.5 for actual tracking.
     velocity_xy_reward = RewTerm(
-        func=mdp.track_lin_vel_xy_exp, weight=7.0, params={"command_name": "base_velocity", "std": 2.0222}
+        func=mdp.track_lin_vel_xy_exp, weight=7.0, params={"command_name": "base_velocity", "std": 0.5}
     )
     velocity_yaw_reward = RewTerm(
-        func=mdp.track_ang_vel_z_exp, weight=3.0, params={"command_name": "base_velocity", "std": 1.1555}
+        func=mdp.track_ang_vel_z_exp, weight=3.0, params={"command_name": "base_velocity", "std": 0.5}
     )
     # 12 revolute joints only, limits read from the walking actuator groups at runtime.
     effort_reward = RewTerm(func=walking_rewards.effort_reward, weight=3.0, params={"asset_cfg": _REVOLUTE})
@@ -189,15 +212,20 @@ class RewardsCfg:
     )
     # Kept wired but disabled: a walking gait is not L/R position-symmetric at every instant.
     symmetry_reward = RewTerm(func=standing_rewards.symmetry_reward, weight=0.0, params={"asset_cfg": _REVOLUTE})
-    # Leadscrew mechanical power sum|F*qdot| [W]. Weight set after telemetry (will be negative).
+    # Log-only terms: RewardManager skips weight-0 terms entirely, so a tiny weight keeps them computed and
+    # logged (Episode_Reward/<term> = weight * mean episode sum; divide by the weight for the raw value).
+    # Commanded leadscrew power sum|F*qdot_cmd| [W]; negative sign so scaling the weight up later penalizes.
     prismatic_power_reward = RewTerm(
-        func=walking_rewards.PrismaticPowerReward,
-        weight=0.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_PRISMATIC_JOINTS, preserve_order=True)},
+        func=walking_rewards.prismatic_power_reward,
+        weight=-1.0e-6,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_PRISMATIC_JOINTS, preserve_order=True),
+            "action_term_name": "prismatic_vel",
+        },
     )
     feet_air_time = RewTerm(
         func=vel_mdp.feet_air_time_positive_biped,
-        weight=0.0,
+        weight=1.0e-6,
         params={
             "command_name": "base_velocity",
             "threshold": 0.4,
@@ -244,12 +272,12 @@ class EventsCfg(StandingEventsCfg):
             "foot_body_names": NOVA_FOOT_BODIES,
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-math.pi, math.pi)},
             "velocity_range": {
-                "x": (-0.5, 0.5),
-                "y": (-0.5, 0.5),
-                "z": (-0.5, 0.5),
-                "roll": (-0.5, 0.5),
-                "pitch": (-0.5, 0.5),
-                "yaw": (-0.5, 0.5),
+                "x": (-0.1, 0.1),
+                "y": (-0.1, 0.1),
+                "z": (-0.1, 0.1),
+                "roll": (-0.1, 0.1),
+                "pitch": (-0.1, 0.1),
+                "yaw": (-0.1, 0.1),
             },
         },
     )
@@ -301,6 +329,7 @@ class NovaWalkingEnvCfg(NovaStandingEnvCfg):
         cmd.ranges.lin_vel_x = (-0.5, 1.0)
         cmd.ranges.lin_vel_y = (-0.4, 0.4)
         cmd.ranges.ang_vel_z = (-1.0, 1.0)
+        cmd.ranges.heading = None  # unused without heading control (avoids the command term's warning)
 
         self.episode_length_s = 20.0
 

@@ -13,12 +13,11 @@ upright_reward / acceleration_reward / symmetry_reward are reused unchanged from
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
+from isaaclab.managers import SceneEntityCfg
 
 # Deferred to TYPE_CHECKING -- see standing mdp/rewards.py (eager import crashes before Kit boots).
 if TYPE_CHECKING:
@@ -48,35 +47,21 @@ def effort_reward(
     return torch.exp(-k * pct_sq_sum)
 
 
-class PrismaticPowerReward(ManagerTermBase):
-    """Mechanical power of the leadscrew joints: sum_j |F_j * qdot_j| [W] (no regeneration credit).
+def prismatic_power_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    action_term_name: str = "prismatic_vel",
+) -> torch.Tensor:
+    """Commanded mechanical power of the leadscrews: sum_j |F_j * qdot_cmd_j| [W] (no regeneration credit).
 
-    F is the actuator's applied force (``robot.data.applied_torque``, N for prismatic joints). qdot is the
-    FINITE DIFFERENCE of joint position over one env step, not ``robot.data.joint_vel``: measured while
-    standing still, PhysX reports a biased prismatic joint velocity (mean |qd| ~0.0115 m/s, lower joints
-    ~+0.02 m/s signed) although the positions change by only ~1e-5 m/s -- which would charge ~4 W of
-    phantom power at rest instead of ~0.004 W. Returned as a raw positive quantity; the (negative) weight
-    is set after telemetry. Holding position costs ~0 W, matching the non-backdrivable leadscrew.
-
-    Note: RewardManager skips terms with weight 0.0 entirely, so this term is not evaluated (and its
-    previous-position buffer not advanced) until it gets a non-zero weight.
+    F is the actuator's applied force (``robot.data.applied_torque``, N). qdot_cmd is the COMMANDED screw
+    velocity clip(a, -1, 1) * v_max exposed by :class:`PrismaticVelocityAction` -- i.e. what the RobStride 00
+    is asked to spin at -- rather than the simulated joint velocity (PhysX reports a biased prismatic joint
+    velocity at standstill, and impacts move the stiff drive without the motor doing work). Holding (a=0)
+    costs 0 W, matching the non-backdrivable leadscrew. ``asset_cfg`` must list the prismatic joints in the
+    same order as the action term (both use NOVA_PRISMATIC_JOINTS with preserve_order=True).
     """
-
-    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
-        self._asset: Articulation = env.scene[asset_cfg.name]
-        self._joint_ids = asset_cfg.joint_ids
-        self._prev_q = self._asset.data.joint_pos.torch[:, self._joint_ids].clone()
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        if env_ids is None:
-            env_ids = slice(None)
-        self._prev_q[env_ids] = self._asset.data.joint_pos.torch[env_ids][:, self._joint_ids]
-
-    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-        q = self._asset.data.joint_pos.torch[:, self._joint_ids]
-        qdot = (q - self._prev_q) / env.step_dt
-        self._prev_q = q.clone()
-        force = self._asset.data.applied_torque.torch[:, self._joint_ids]
-        return torch.sum(torch.abs(force * qdot), dim=1)
+    asset: Articulation = env.scene[asset_cfg.name]
+    force = asset.data.applied_torque.torch[:, asset_cfg.joint_ids]
+    qdot_cmd = env.action_manager.get_term(action_term_name).commanded_velocity
+    return torch.sum(torch.abs(force * qdot_cmd), dim=1)

@@ -5,8 +5,9 @@
 
 """Velocity-command action term for NOVA's leadscrew-driven prismatic (leg-length) joints.
 
-The real leadscrews are non-backdrivable and speed-limited (0.015 m/s), so the policy does not
-command a leg length directly. Instead each action is a normalized *velocity* command that
+The real leadscrews (T12x8 4-start trapezoidal, bronze nut, driven directly by a RobStride 00) are
+non-backdrivable and speed-limited (~0.035-0.041 m/s at walking loads), so the policy does not command a
+leg length directly. Instead each action is a normalized *velocity* command that
 integrates into a persistent position target:
 
     a        = clip(raw, -1, 1)
@@ -81,6 +82,19 @@ class PrismaticVelocityAction(ActionTerm):
     def joint_names(self) -> list[str]:
         return self._joint_names
 
+    @property
+    def joint_ids(self) -> list[int]:
+        """Articulation joint indices of the controlled prismatic joints, in action order."""
+        return self._joint_ids
+
+    @property
+    def commanded_velocity(self) -> torch.Tensor:
+        """Commanded screw velocity clip(raw, -1, 1) * max_velocity [m/s], shape (num_envs, action_dim).
+
+        Note: this is the *commanded* rate, so it stays non-zero when the target is pinned at a clamp bound.
+        """
+        return self._raw_actions.clamp(-1.0, 1.0) * self.cfg.max_velocity
+
     """
     Operations.
     """
@@ -112,8 +126,10 @@ class PrismaticVelocityActionCfg(ActionTermCfg):
     """Joint names or regex expressions of the prismatic joints."""
     preserve_order: bool = True
     """Keep the action ordering identical to :attr:`joint_names`."""
-    max_velocity: float = 0.015
-    """Leadscrew speed limit [m/s]; a unit action moves the target by ``max_velocity * step_dt``."""
+    max_velocity: float = 0.035
+    """Leadscrew speed limit [m/s]; a unit action moves the target by ``max_velocity * step_dt``.
+
+    Default 0.035 m/s: RobStride 00 (10:1, 315 rpm no-load) on an 8 mm-lead screw at walking loads."""
     q_min: float = 0.005
     """Lower clamp of the position target [m] (kept off the 0.0 hard stop)."""
     q_max: float = 0.095
