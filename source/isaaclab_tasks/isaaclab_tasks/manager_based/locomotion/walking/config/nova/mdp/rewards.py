@@ -52,16 +52,18 @@ def prismatic_power_reward(
     asset_cfg: SceneEntityCfg,
     action_term_name: str = "prismatic_vel",
 ) -> torch.Tensor:
-    """Commanded mechanical power of the leadscrews: sum_j |F_j * qdot_cmd_j| [W] (no regeneration credit).
+    """Mechanical power of the leadscrews: sum_j |F_j * target_rate_j| [W] (no regeneration credit).
 
-    F is the actuator's applied force (``robot.data.applied_torque``, N). qdot_cmd is the COMMANDED screw
-    velocity clip(a, -1, 1) * v_max exposed by :class:`PrismaticVelocityAction` -- i.e. what the RobStride 00
-    is asked to spin at -- rather than the simulated joint velocity (PhysX reports a biased prismatic joint
-    velocity at standstill, and impacts move the stiff drive without the motor doing work). Holding (a=0)
-    costs 0 W, matching the non-backdrivable leadscrew. ``asset_cfg`` must list the prismatic joints in the
+    F is the actuator's applied force (``robot.data.applied_torque``, N). target_rate is the actual rate of
+    change of the clamped position target exposed by :class:`PrismaticVelocityAction` -- i.e. what the
+    RobStride 00 really drives the screw at. Not the raw command clip(a, -1, 1) * v_max: that stays non-zero
+    when the target is pinned at the software clamp (0.005 / 0.095 m) where the motor does no work, which
+    would falsely penalize extreme leg lengths. Not the simulated joint velocity either: PhysX reports a
+    biased prismatic joint velocity at standstill, and impacts move the stiff drive without the motor doing
+    work. Holding (a=0) or pushing against a clamp costs 0 W. ``asset_cfg`` must list the prismatic joints in the
     same order as the action term (both use NOVA_PRISMATIC_JOINTS with preserve_order=True).
     """
     asset: Articulation = env.scene[asset_cfg.name]
     force = asset.data.applied_torque.torch[:, asset_cfg.joint_ids]
-    qdot_cmd = env.action_manager.get_term(action_term_name).commanded_velocity
-    return torch.sum(torch.abs(force * qdot_cmd), dim=1)
+    target_rate = env.action_manager.get_term(action_term_name).target_rate
+    return torch.sum(torch.abs(force * target_rate), dim=1)

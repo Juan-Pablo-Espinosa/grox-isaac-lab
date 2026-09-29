@@ -214,7 +214,8 @@ class RewardsCfg:
     symmetry_reward = RewTerm(func=standing_rewards.symmetry_reward, weight=0.0, params={"asset_cfg": _REVOLUTE})
     # Log-only terms: RewardManager skips weight-0 terms entirely, so a tiny weight keeps them computed and
     # logged (Episode_Reward/<term> = weight * mean episode sum; divide by the weight for the raw value).
-    # Commanded leadscrew power sum|F*qdot_cmd| [W]; negative sign so scaling the weight up later penalizes.
+    # Leadscrew power sum|F*target_rate| [W] (0 when holding or pinned at a clamp); negative sign so scaling the
+    # weight up later penalizes.
     prismatic_power_reward = RewTerm(
         func=walking_rewards.prismatic_power_reward,
         weight=-1.0e-6,

@@ -32,7 +32,7 @@ class NovaWalkingEnv(ManagerBasedRLEnv):
         log = dict(extras.get("log", {}))
         log["Metrics/prismatic_upper_q_mean"] = q[:, 0:2].mean()
         log["Metrics/prismatic_lower_q_mean"] = q[:, 2:4].mean()
-        log["Metrics/prismatic_qdot_cmd_abs_mean"] = prismatic_term.commanded_velocity.abs().mean()
+        log["Metrics/prismatic_target_rate_abs_mean"] = prismatic_term.target_rate.abs().mean()
         log["Metrics/command_planar_speed_mean"] = torch.linalg.norm(cmd[:, :2], dim=1).mean()
         extras["log"] = log
         self.extras = extras

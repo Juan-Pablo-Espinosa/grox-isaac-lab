@@ -55,11 +55,14 @@ class PrismaticVelocityAction(ActionTerm):
         )
         self._num_joints = len(self._joint_ids)
         # max target change per env step [m]
-        self._dq_max = self.cfg.max_velocity * env.step_dt
+        self._dt = env.step_dt
+        self._dq_max = self.cfg.max_velocity * self._dt
         self._raw_actions = torch.zeros(self.num_envs, self._num_joints, device=self.device)
         # persistent position target, starts at the asset defaults
         default = self._asset.data.default_joint_pos.torch[:, self._joint_ids].clone()
         self._q_target = default.clamp(self.cfg.q_min, self.cfg.q_max)
+        # actual rate of change of the integrated target this step [m/s]; 0 when pinned at a clamp bound
+        self._target_rate = torch.zeros_like(self._q_target)
 
     """
     Properties.
@@ -92,8 +95,18 @@ class PrismaticVelocityAction(ActionTerm):
         """Commanded screw velocity clip(raw, -1, 1) * max_velocity [m/s], shape (num_envs, action_dim).
 
         Note: this is the *commanded* rate, so it stays non-zero when the target is pinned at a clamp bound.
+        Use :attr:`target_rate` for the rate the screw is actually driven at.
         """
         return self._raw_actions.clamp(-1.0, 1.0) * self.cfg.max_velocity
+
+    @property
+    def target_rate(self) -> torch.Tensor:
+        """Actual rate of change of the clamped position target this step [m/s], shape (num_envs, action_dim).
+
+        Equals :attr:`commanded_velocity` except when the target is pinned at ``q_min``/``q_max``, where it is
+        exactly 0 (the motor does no work there). Zeroed on reset.
+        """
+        return self._target_rate
 
     """
     Operations.
@@ -102,7 +115,9 @@ class PrismaticVelocityAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         a = actions.clamp(-1.0, 1.0)
-        self._q_target = (self._q_target + a * self._dq_max).clamp(self.cfg.q_min, self.cfg.q_max)
+        q_prev = self._q_target
+        self._q_target = (q_prev + a * self._dq_max).clamp(self.cfg.q_min, self.cfg.q_max)
+        self._target_rate = (self._q_target - q_prev) / self._dt
 
     def apply_actions(self):
         self._asset.set_joint_position_target_index(target=self._q_target, joint_ids=self._joint_ids)
@@ -111,6 +126,7 @@ class PrismaticVelocityAction(ActionTerm):
         if env_ids is None:
             env_ids = slice(None)
         self._raw_actions[env_ids] = 0.0
+        self._target_rate[env_ids] = 0.0
         # re-anchor the target to wherever the reset event just placed the joints
         q = self._asset.data.joint_pos.torch[env_ids][:, self._joint_ids]
         self._q_target[env_ids] = q.clamp(self.cfg.q_min, self.cfg.q_max)
