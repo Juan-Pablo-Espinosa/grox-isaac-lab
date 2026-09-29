@@ -11,9 +11,8 @@ from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPp
 @configclass
 class NovaWalkingPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    # ~4 h long run: floor(4 h / 1.243 s/iter) at 4096 envs, measured with headless training plus a concurrent
-    # 4-env Newton-viewer play session (the watched setup). Without the viewer it runs at ~0.78 s/iter (~2.5 h).
-    max_iterations = 11584
+    # Long run (~4-5 h at 4096 envs: ~0.78 s/iter headless, ~1.24 s/iter while a 4-env viewer play session runs).
+    max_iterations = 15000
     save_interval = 250
     experiment_name = "nova_walking"
     actor = RslRlMLPModelCfg(

@@ -56,18 +56,20 @@ NOVA_FOOT_BODIES = ["Feet_Pitch_Left", "Feet_Pitch_Right"]
 ##
 # Prismatics at mid-travel (0.05 m of the 0..0.1 m hard range), knees bent 0.30 rad (flexion is L+/R-,
 # matching the startup knee limits L [0, 1.85], R [-1.85, 0]). Hip_Pitch / Feet_Pitch were solved per leg
-# so the sole normal is parallel to world Z (achieved tilt 0.14 deg L / 0.10 deg R) and the sole centroid
-# is directly below Hip_Base along the walking axis (<0.1 mm). Signs were measured, not assumed:
-# Hip_Pitch is OPPOSITE-sign L/R, Feet_Pitch is SAME-sign L/R (matches symmetry_reward's convention).
+# so the sole normal is parallel to world Z (achieved tilt 0.07 deg L / 0.01 deg R) and Hip_Base is over the
+# midpoint of the two AREA-weighted sole centroids (dx 0.02 mm; dy 0.72 mm, the URDF's knee-origin asymmetry,
+# which pitch joints cannot remove). The first solve used a vertex-weighted sole centroid, biased 23 mm toward
+# the heel by the STL tessellation, which left Hip_Base 23 mm behind the sole centre. Signs were measured,
+# not assumed: Hip_Pitch is OPPOSITE-sign L/R, Feet_Pitch is SAME-sign L/R (matches symmetry_reward).
 NOVA_WALKING_DEFAULT_JOINT_POS = {
     "Upperleg_Prismatic_.*": 0.05,
     "Lowerleg_Prismatic_.*": 0.05,
     "Lowerleg_Pitch_Left_Joint": 0.30,
     "Lowerleg_Pitch_Right_Joint": -0.30,
-    "Hip_Pitch_Left_Joint": 0.12305,
-    "Hip_Pitch_Right_Joint": -0.12361,
-    "Feet_Pitch_Left_Joint": 0.18677,
-    "Feet_Pitch_Right_Joint": 0.18627,
+    "Hip_Pitch_Left_Joint": 0.08811,
+    "Hip_Pitch_Right_Joint": -0.08842,
+    "Feet_Pitch_Left_Joint": 0.21891,
+    "Feet_Pitch_Right_Joint": 0.21863,
     "Hip_Roll_.*": 0.0,
     "Upperleg_Yaw_.*": 0.0,
     "Feet_Roll_.*": 0.0,
@@ -75,11 +77,11 @@ NOVA_WALKING_DEFAULT_JOINT_POS = {
 # Standing height of Hip_Base above the lowest sole point at the default revolute pose, as a function of
 # the prismatic positions: H = H0 + K_UP*q_up + K_LOW*q_low (exactly linear, fit residual < 0.001 mm).
 # K_UP/K_LOW < 1 are the cosines of the thigh / shank tilt at this pose.
-NOVA_H0 = 0.78936
-NOVA_K_UP = 0.99359
-NOVA_K_LOW = 0.98261
+NOVA_H0 = 0.78822
+NOVA_K_UP = 0.99671
+NOVA_K_LOW = 0.97613
 NOVA_SPAWN_CLEARANCE = 0.01
-NOVA_DEFAULT_HEIGHT = NOVA_H0 + (NOVA_K_UP + NOVA_K_LOW) * 0.05  # 0.88817 m
+NOVA_DEFAULT_HEIGHT = NOVA_H0 + (NOVA_K_UP + NOVA_K_LOW) * 0.05  # 0.88686 m
 
 ##
 # Actuators
@@ -108,16 +110,18 @@ def prismatic_damping(stiffness: float) -> float:
 
 
 # Revolute gains are SIM-ONLY (hardware gains unknown). Lowest per-group kp for which 64 envs at the exact default
-# pose, zero action, zero root reset velocity all stay up for 5 s (0 bad_tilt / illegal_contact), found by a
-# per-group descent from kp=2000 and a combined check (the per-group minima 50/25/25/150 together failed 56/64;
-# one ladder step up passes 64/64, twice). kd = 2*sqrt(kp*I_eff) (damping ratio 1), I_eff = diagonal of the
-# floating-base joint-space mass matrix at the default pose [kg*m^2]: Hip_Pitch 1.085, Lowerleg_Pitch 0.166,
-# Hip_Roll 1.246, Upperleg_Yaw 0.0335, Feet_Roll 0.00084, Feet_Pitch 0.00334.
+# pose, zero action, zero root reset velocity all stay up for 5 s (0 bad_tilt / illegal_contact). Hip/knee, roll and
+# yaw come from a per-group descent from kp=2000 plus a combined check (minima 50/25/25 together with feet 150
+# failed 56/64 at the first default pose; one ladder step up passed 64/64 twice). Feet were re-swept after the pose
+# was re-solved on the area-weighted sole: kp 200 and 150 pass 64/64 (peak |tau| 52% / 69% of the 32 N*m limit),
+# 100 fails (34/64). kd = 2*sqrt(kp*I_eff) (damping ratio 1), I_eff = diagonal of the floating-base joint-space mass
+# matrix at the default pose [kg*m^2]: Hip_Pitch 1.085, Lowerleg_Pitch 0.166, Hip_Roll 1.246, Upperleg_Yaw 0.0335,
+# Feet_Roll 0.00086, Feet_Pitch 0.00334.
 NOVA_REVOLUTE_GAINS = {
     "hip_pitch_knee": (75.0, {"Hip_Pitch_.*": 18.04, "Lowerleg_Pitch_.*": 7.05}),
     "hip_roll": (35.0, 13.21),
     "upperleg_yaw": (35.0, 2.17),
-    "feet": (200.0, {"Feet_Roll_.*": 0.82, "Feet_Pitch_.*": 1.63}),
+    "feet": (150.0, {"Feet_Roll_.*": 0.72, "Feet_Pitch_.*": 1.42}),
 }
 
 
@@ -212,8 +216,8 @@ class RewardsCfg:
     )
     # Kept wired but disabled: a walking gait is not L/R position-symmetric at every instant.
     symmetry_reward = RewTerm(func=standing_rewards.symmetry_reward, weight=0.0, params={"asset_cfg": _REVOLUTE})
-    # Log-only terms: RewardManager skips weight-0 terms entirely, so a tiny weight keeps them computed and
-    # logged (Episode_Reward/<term> = weight * mean episode sum; divide by the weight for the raw value).
+    # Log-only term: RewardManager skips weight-0 terms entirely, so a tiny weight keeps it computed and logged
+    # (Episode_Reward/<term> = weight * mean episode sum; divide by the weight for the raw value).
     # Leadscrew power sum|F*target_rate| [W] (0 when holding or pinned at a clamp); negative sign so scaling the
     # weight up later penalizes.
     prismatic_power_reward = RewTerm(
@@ -224,9 +228,11 @@ class RewardsCfg:
             "action_term_name": "prismatic_vel",
         },
     )
+    # Stock biped term (single-stance time capped at threshold, zero when ||cmd_xy|| <= 0.1). Weight = 0.25 x
+    # velocity_xy (7), the stock H1/G1 ROUGH ratio (0.25 / 1.0); the stock FLAT variants use 0.75-1.0x.
     feet_air_time = RewTerm(
         func=vel_mdp.feet_air_time_positive_biped,
-        weight=1.0e-6,
+        weight=1.75,
         params={
             "command_name": "base_velocity",
             "threshold": 0.4,
