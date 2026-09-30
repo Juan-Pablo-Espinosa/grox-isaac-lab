@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Task-level spawn function that enables contact reporting on ALL of NOVA's (nested) rigid bodies.
+"""Task-level spawn function: contact reporting on ALL of NOVA's (nested) rigid bodies + self-collision filter pairs.
 
 Root cause (documented in the standing task, standing_env_cfg.py): NOVA's USD authors every link as a
 USD *child* of its kinematic parent. ``isaaclab.sim.schemas.activate_contact_sensors`` stops descending
@@ -31,6 +31,18 @@ if TYPE_CHECKING:
     from isaaclab.sim.spawners.from_files import from_files_cfg
 
 
+# Non-adjacent body pairs whose convex-hull colliders overlap at the default pose. PhysX already ignores collisions
+# between directly jointed links, but these pairs are separated only by a small intermediate link (Hip_Roll /
+# Feet_Roll). With articulation self-collisions enabled they were in permanent contact at rest (every env, every step),
+# which toppled the robot in a zero-action stand (489 bad_tilt terminations in 5 s x 64 envs) and blocked hip roll.
+# Only these pairs are filtered; every other self-collision (incl. all left-right leg contacts) stays active.
+NOVA_SELF_COLLISION_FILTER_PAIRS = [
+    (f"{a}_{side}", f"{b}_{side}")
+    for side in ("Left", "Right")
+    for a, b in (("Hip_Pitch", "Upperleg_Yaw"), ("Lowerleg_Prismatic", "Feet_Pitch"))
+]
+
+
 @clone
 def spawn_usd_with_nested_contact_reporting(
     prim_path: str,
@@ -46,6 +58,13 @@ def spawn_usd_with_nested_contact_reporting(
     from isaaclab.sim.utils import safe_set_attribute_on_usd_prim
 
     prim = _spawn_from_usd_file(prim_path, cfg.usd_path, cfg, translation, orientation)
+    bodies = {}
+    for p in Usd.PrimRange(prim):
+        if p.HasAPI(UsdPhysics.RigidBodyAPI):
+            bodies[p.GetName()] = p
+    # collision filtering for the resting-overlap pairs (see NOVA_SELF_COLLISION_FILTER_PAIRS)
+    for a, b in NOVA_SELF_COLLISION_FILTER_PAIRS:
+        UsdPhysics.FilteredPairsAPI.Apply(bodies[a]).CreateFilteredPairsRel().AddTarget(bodies[b].GetPath())
     for p in Usd.PrimRange(prim):
         if not p.HasAPI(UsdPhysics.RigidBodyAPI):
             continue

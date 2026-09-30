@@ -19,7 +19,14 @@ Measured PhysX view semantics (probe, 3 envs):
   * an explicit per-env list ``env_{e}/Robot/<nested path>`` in env-major order -> correct env-major view.
 
 This subclass therefore replaces only the view construction with the explicit env-major list, verifies
-the ordering at init, and otherwise reuses the stock buffers/kernels. Filtered contacts are not supported.
+the ordering at init, and otherwise reuses the stock buffers/kernels.
+
+Filtered contacts (``filter_prim_paths_expr``) are supported: PhysX takes one filter list per sensor pattern (all of
+equal length), so each sensor (env e, body b) gets env e's filter list. A filter expression is either
+  * ``<env-parent>/<leaf regex>`` (e.g. ``/World/envs/env_.*/Robot/.*_Right``): resolved like the sensor bodies, by a
+    recursive walk for rigid bodies whose name fully matches the leaf regex (works for nested bodies), or
+  * an absolute prim path without ``env_`` (e.g. the ground plane collider), used as-is for every sensor.
+Contact points / friction forces are not supported.
 
 This module imports Kit-dependent packages (omni.physics via isaaclab_physx.physics); it is only loaded lazily
 through the string ``class_type`` in :mod:`.contact_sensor_cfg`, because task configs are imported before Kit starts.
@@ -41,8 +48,8 @@ class NestedBodyContactSensor(ContactSensor):
     def _initialize_impl(self):
         # base-class setup (sim handles, env count, buffers bookkeeping) -- skip ContactSensor's flat-glob views
         super(ContactSensor, self)._initialize_impl()
-        if self.cfg.filter_prim_paths_expr or self.cfg.track_contact_points or self.cfg.track_friction_forces:
-            raise ValueError("NestedBodyContactSensor supports net contact forces only (no filters / contact points).")
+        if self.cfg.track_contact_points or self.cfg.track_friction_forces:
+            raise ValueError("NestedBodyContactSensor supports net and filtered forces only (no contact points).")
         self._physics_sim_view = SimulationManager.get_physics_sim_view()
 
         parent_expr, leaf_pattern = self.cfg.prim_path.rsplit("/", 1)
@@ -67,10 +74,12 @@ class NestedBodyContactSensor(ContactSensor):
 
         # explicit env-major list: env_0/<all bodies>, env_1/<all bodies>, ...
         patterns = [f"{parent.replace('env_*', f'env_{e}')}/{rel}" for e in range(self._num_envs) for rel in rel_paths]
+        filter_lists = self._resolve_filters()  # one list per env, or None
         self._body_physx_view = self._physics_sim_view.create_rigid_body_view(patterns)
-        self._contact_view = self._physics_sim_view.create_rigid_contact_view(
-            patterns, max_contact_data_count=self.cfg.max_contact_data_count_per_prim * len(rel_paths) * self._num_envs
-        )
+        kwargs = {"max_contact_data_count": self.cfg.max_contact_data_count_per_prim * len(rel_paths) * self._num_envs}
+        if filter_lists is not None:
+            kwargs["filter_patterns"] = [filter_lists[e] for e in range(self._num_envs) for _ in rel_paths]
+        self._contact_view = self._physics_sim_view.create_rigid_contact_view(patterns, **kwargs)
         if self._body_physx_view is None or self._contact_view is None:
             raise RuntimeError("Failed to create PhysX views for the nested-body contact sensor.")
         self._num_sensors = self.body_physx_view.count // self._num_envs
@@ -84,4 +93,47 @@ class NestedBodyContactSensor(ContactSensor):
                 f"/env_{e}/" not in p for p in block
             ):
                 raise RuntimeError(f"Contact view is not env-major at env {e}: {block[:3]}...")
+        if filter_lists is not None and self._contact_view.filter_count != len(filter_lists[0]):
+            n_filters = len(filter_lists[0])
+            raise RuntimeError(
+                f"Contact view filter_count {self._contact_view.filter_count} != {n_filters} per sensor."
+            )
+        self._filter_names = [f.rsplit("/", 1)[-1] for f in filter_lists[0]] if filter_lists is not None else []
         self._create_buffers()
+
+    @property
+    def filter_names(self) -> list[str]:
+        """Leaf names of the filter prims, in force_matrix column order (empty if unfiltered)."""
+        return self._filter_names
+
+    def _resolve_filters(self) -> list[list[str]] | None:
+        """Explicit per-env filter prim paths (same length for every env), or None if no filters are configured."""
+        from pxr import UsdPhysics
+
+        if not self.cfg.filter_prim_paths_expr:
+            return None
+        per_env: list[list[str]] = [[] for _ in range(self._num_envs)]
+        for expr in self.cfg.filter_prim_paths_expr:
+            if "env_" not in expr:
+                for e in range(self._num_envs):
+                    per_env[e].append(expr)
+                continue
+            parent_expr, leaf = expr.rsplit("/", 1)
+            name_re = re.compile(leaf)
+            matches = resolve_matching_prims_from_source(parent_expr)
+            if not matches:
+                raise RuntimeError(f"No prim found for filter parent '{parent_expr}'.")
+            asset_prim, parent = matches[0]
+            root = asset_prim.GetPath().pathString
+            prims = get_all_matching_child_prims(
+                root,
+                predicate=lambda p: bool(name_re.fullmatch(p.GetName())) and p.HasAPI(UsdPhysics.RigidBodyAPI),
+                traverse_instance_prims=False,
+            )
+            rel = [p.GetPath().pathString[len(root) + 1 :] for p in prims]
+            if not rel:
+                raise RuntimeError(f"Filter expression '{expr}' matched no rigid bodies.")
+            parent = parent.replace("env_.*", "env_*")
+            for e in range(self._num_envs):
+                per_env[e] += [f"{parent.replace('env_*', f'env_{e}')}/{r}" for r in rel]
+        return per_env

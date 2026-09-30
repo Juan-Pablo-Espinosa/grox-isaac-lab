@@ -146,3 +146,15 @@ def max_swing_penalty(
     """sum over feet of clamp(current_air_time - max_swing, 0, cap) [s]: a foot held in the air too long."""
     data, ids = _feet_times(env, sensor_cfg)
     return (data.current_air_time.torch[:, ids] - max_swing).clamp(min=0.0, max=cap).sum(dim=1)
+
+
+def leg_self_contact_penalty(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float = 1.0
+) -> torch.Tensor:
+    """Number of (left-leg body, right-leg body) pairs pressing on each other with more than ``threshold`` [N].
+
+    ``sensor_cfg`` names a contact sensor on the left-leg bodies filtered against the right-leg bodies, so its
+    ``force_matrix_w`` holds one force per L-R body pair. Returned positive (use a negative weight).
+    """
+    f = env.scene.sensors[sensor_cfg.name].data.force_matrix_w.torch  # (N, B_left, F_right, 3)
+    return (torch.linalg.norm(f, dim=-1) > threshold).sum(dim=(1, 2)).float()

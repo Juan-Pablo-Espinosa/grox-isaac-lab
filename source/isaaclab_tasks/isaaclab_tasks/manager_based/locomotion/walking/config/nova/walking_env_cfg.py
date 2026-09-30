@@ -40,6 +40,7 @@ from isaaclab_tasks.manager_based.locomotion.standing.config.nova.standing_env_c
 
 from .mdp import events as walking_events
 from .mdp import rewards as walking_rewards
+from .mdp import terminations as walking_terminations
 from .mdp.actions import PrismaticVelocityActionCfg
 from .mdp.contact_sensor_cfg import NestedBodyContactSensorCfg
 
@@ -50,6 +51,8 @@ NOVA_PRISMATIC_JOINTS = [
     "Lowerleg_Prismatic_Right_Joint",
 ]
 NOVA_FOOT_BODIES = ["Feet_Pitch_Left", "Feet_Pitch_Right"]
+# Static ground-plane collider of the flat terrain (TerrainImporterCfg terrain_type="plane").
+GROUND_COLLIDER = "/World/ground/terrain/GroundPlane/CollisionPlane"
 
 ##
 # Default pose (solved by pure-kinematics FK, see the task report / scripts in the commit message)
@@ -278,6 +281,12 @@ class RewardsCfg:
             "cap": 1.0,
         },
     )
+    # Left-leg body touching a right-leg body (self-collisions are on): number of L-R body pairs with > 1 N.
+    leg_self_contact = RewTerm(
+        func=walking_rewards.leg_self_contact_penalty,
+        weight=-2.0,
+        params={"sensor_cfg": SceneEntityCfg("leg_contact"), "threshold": 1.0},
+    )
     # Hip_Base height vs the leg-length-dependent standing height H(q); sigma 0.08 m: |z-H| 0.03 -> 0.869,
     # 0.10 -> 0.210, 0.30 -> 8e-7 (run 1's split sat ~0.3 m low).
     height_tracking_reward = RewTerm(
@@ -312,12 +321,13 @@ class TerminationsCfg:
     # Fixed floor (not leg-length dependent): 0.47 m ~= 0.6 * H0 (H0 = 0.788 m, shortest-leg standing height).
     # World-frame root z, valid on the flat plane.
     base_height = DoneTerm(func=mdp.root_height_below_minimum, params={"minimum_height": 0.47})
-    # All 13 non-foot bodies (everything except Feet_Roll_* / Feet_Pitch_*), 5 N.
+    # All 13 non-foot bodies (everything except Feet_Roll_* / Feet_Pitch_*) touching the GROUND with > 5 N. Ground-only
+    # (filtered sensor) since self-collisions are on: leg-on-leg contact is penalized, never terminated.
     base_contact = DoneTerm(
-        func=mdp.illegal_contact,
+        func=walking_terminations.illegal_ground_contact,
         params={
             "sensor_cfg": SceneEntityCfg(
-                "contact_forces",
+                "ground_contact",
                 body_names=["Hip_Base", "Hip_Pitch_.*", "Hip_Roll_.*", "Upperleg_.*", "Lowerleg_.*"],
             ),
             "threshold": 5.0,
@@ -391,6 +401,19 @@ class NovaWalkingEnvCfg(NovaStandingEnvCfg):
         # time), but the nested-body-aware PhysX sensor (see mdp/contact_sensor.py). PhysX backend only.
         self.scene.contact_forces = NestedBodyContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True
+        )
+        # filtered sensors: every body vs the ground collider (illegal-contact termination), and left-leg vs right-leg
+        # bodies (leg_self_contact penalty)
+        self.scene.ground_contact = NestedBodyContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, filter_prim_paths_expr=[GROUND_COLLIDER]
+        )
+        self.scene.leg_contact = NestedBodyContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/.*_Left", filter_prim_paths_expr=["{ENV_REGEX_NS}/Robot/.*_Right"]
+        )
+        # self-collisions on (walking only; the standing task and nova.py keep them off). Legs could pass through each
+        # other before (run 3's L-R leg clouds were within 1 cm in 82-90% of samples).
+        self.scene.robot.spawn.articulation_props = self.scene.robot.spawn.articulation_props.replace(
+            enabled_self_collisions=True
         )
 
         # -- commands (undo standing's zero pinning)
