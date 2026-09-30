@@ -255,6 +255,29 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=NOVA_FOOT_BODIES),
         },
     )
+    # Gait-shape terms (contact sensor air/contact times on Feet_Pitch_*). Run 3 learned a population-wide one-leg hop:
+    # the left foot stayed airborne for up to 19 s, which feet_air_time_positive_biped pays at its 0.4 s cap every
+    # single-stance step (min(air_L, contact_R) = 0.4) without any stepping. These counter one-leg hops (balance),
+    # bunny hops (flight) and a foot parked in the air (max swing).
+    contact_balance = RewTerm(
+        func=walking_rewards.contact_balance_penalty,
+        weight=-2.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=NOVA_FOOT_BODIES, preserve_order=True)},
+    )
+    flight = RewTerm(
+        func=walking_rewards.flight_penalty,
+        weight=-2.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=NOVA_FOOT_BODIES, preserve_order=True)},
+    )
+    max_swing = RewTerm(
+        func=walking_rewards.max_swing_penalty,
+        weight=-3.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=NOVA_FOOT_BODIES, preserve_order=True),
+            "max_swing": 0.6,
+            "cap": 1.0,
+        },
+    )
     # Hip_Base height vs the leg-length-dependent standing height H(q); sigma 0.08 m: |z-H| 0.03 -> 0.869,
     # 0.10 -> 0.210, 0.30 -> 8e-7 (run 1's split sat ~0.3 m low).
     height_tracking_reward = RewTerm(

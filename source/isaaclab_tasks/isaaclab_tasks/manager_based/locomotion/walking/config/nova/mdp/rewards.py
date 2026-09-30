@@ -110,3 +110,39 @@ def foot_flat_reward(
     tilt = torch.acos(n_z.clamp(-1.0, 1.0))
     in_contact = sensor.data.current_contact_time.torch[:, sensor_cfg.body_ids] > 0.0
     return torch.sum(in_contact.float() * torch.exp(-(tilt**2) / sigma**2), dim=1)
+
+
+def _feet_times(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg):
+    data = env.scene.sensors[sensor_cfg.name].data
+    ids = sensor_cfg.body_ids
+    return data, ids
+
+
+def contact_balance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, max_diff: float = 1.0) -> torch.Tensor:
+    """|last_air_L - last_air_R| + |last_contact_L - last_contact_R| [s], each difference clamped to ``max_diff``.
+
+    Uses the sensor's last completed swing / stance durations of the two feet listed in ``sensor_cfg`` (L, R): ~0 for an
+    alternating gait, large when one leg does all the stance work (one-leg hopping). Returned positive (use a
+    negative weight).
+    """
+    data, ids = _feet_times(env, sensor_cfg)
+    air = data.last_air_time.torch[:, ids]
+    con = data.last_contact_time.torch[:, ids]
+    d_air = (air[:, 0] - air[:, 1]).abs().clamp(max=max_diff)
+    d_con = (con[:, 0] - con[:, 1]).abs().clamp(max=max_diff)
+    return d_air + d_con
+
+
+def flight_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """1 when every foot in ``sensor_cfg`` is out of contact (flight phase / bunny hop), else 0."""
+    data, ids = _feet_times(env, sensor_cfg)
+    in_contact = data.current_contact_time.torch[:, ids] > 0.0
+    return (~in_contact).all(dim=1).float()
+
+
+def max_swing_penalty(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, max_swing: float = 0.6, cap: float = 1.0
+) -> torch.Tensor:
+    """sum over feet of clamp(current_air_time - max_swing, 0, cap) [s]: a foot held in the air too long."""
+    data, ids = _feet_times(env, sensor_cfg)
+    return (data.current_air_time.torch[:, ids] - max_swing).clamp(min=0.0, max=cap).sum(dim=1)
