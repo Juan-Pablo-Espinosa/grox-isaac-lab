@@ -203,11 +203,13 @@ class RewardsCfg:
     upright_reward = RewTerm(func=standing_rewards.upright_reward, weight=15.0)
     # Same functions as standing (they already track env.command_manager.get_command("base_velocity")); std
     # tightened from standing's drift-penalty values (2.0222 m/s, 1.1555 rad/s) to 0.5 for actual tracking.
+    # Weights 7/3 -> 14/6: run 2 converged to standing still (error_vel_xy ~= commanded speed), because walking
+    # beat standing by only ~+0.75/step against the static-friendly terms (upright, effort, height, acceleration).
     velocity_xy_reward = RewTerm(
-        func=mdp.track_lin_vel_xy_exp, weight=7.0, params={"command_name": "base_velocity", "std": 0.5}
+        func=mdp.track_lin_vel_xy_exp, weight=14.0, params={"command_name": "base_velocity", "std": 0.5}
     )
     velocity_yaw_reward = RewTerm(
-        func=mdp.track_ang_vel_z_exp, weight=3.0, params={"command_name": "base_velocity", "std": 0.5}
+        func=mdp.track_ang_vel_z_exp, weight=6.0, params={"command_name": "base_velocity", "std": 0.5}
     )
     # 12 revolute joints only, limits read from the walking actuator groups at runtime.
     # k = ln(2)/2.0: sum (tau/tau_lim)^2 = 2.0 earns 0.5 (stand p90 0.29 -> 0.904; run 1's saturated split at
@@ -217,10 +219,10 @@ class RewardsCfg:
         func=walking_rewards.effort_reward, weight=3.0, params={"asset_cfg": _REVOLUTE, "k": NOVA_EFFORT_K}
     )
     # Stock joint_deviation_hip (joint_deviation_l1 on hip yaw + roll; H1 -0.2, G1 -0.1 vs a lin-vel tracking weight
-    # of 1.0) scaled by our 7x tracking weight: G1's -0.1 * 7 = -0.7 (H1's would be -1.4). Targets splay exploits.
+    # of 1.0). -1.4 = H1's -0.2 x 7 (= G1's -0.1 x our 14x tracking weight). Targets splay exploits.
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.7,
+        weight=-1.4,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["Hip_Roll_.*", "Upperleg_Yaw_.*"])},
     )
     # TODO: k=0.0000189 was fitted on standing telemetry; recalibrate the anchor on walking telemetry.
@@ -241,11 +243,12 @@ class RewardsCfg:
             "action_term_name": "prismatic_vel",
         },
     )
-    # Stock biped term (single-stance time capped at threshold, zero when ||cmd_xy|| <= 0.1). Weight = 0.25 x
-    # velocity_xy (7), the stock H1/G1 ROUGH ratio (0.25 / 1.0); the stock FLAT variants use 0.75-1.0x.
+    # Stock biped term (single-stance time capped at threshold, zero when ||cmd_xy|| <= 0.1). Weight 5.25 = 0.375 x
+    # velocity_xy (14); stock ratios: H1/G1 rough 0.25, G1 flat 0.75, H1 flat 1.0. Raised from 1.75 (0.25 x 7)
+    # after run 2 learned to stand still (air time ~0.0002).
     feet_air_time = RewTerm(
         func=vel_mdp.feet_air_time_positive_biped,
-        weight=1.75,
+        weight=5.25,
         params={
             "command_name": "base_velocity",
             "threshold": 0.4,

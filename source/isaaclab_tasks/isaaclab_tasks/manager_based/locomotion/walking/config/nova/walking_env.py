@@ -49,6 +49,14 @@ class NovaWalkingEnv(ManagerBasedRLEnv):
         pos, quat = robot.data.body_link_pos_w.torch, robot.data.body_link_quat_w.torch
         d = quat_apply_inverse(quat[:, self._hip_base_id], pos[:, self._foot_ids[0]] - pos[:, self._foot_ids[1]])
         log["Metrics/feet_separation_mean"] = torch.linalg.norm(d[:, :2], dim=1).mean()
+        # hopping detector: last completed swing duration per foot, averaged over envs (~0 alternating, ~1 one-leg hop)
+        contact = self.scene["contact_forces"]
+        if not hasattr(self, "_sensor_foot_ids"):
+            self._sensor_foot_ids = [contact.body_names.index(n) for n in ("Feet_Pitch_Left", "Feet_Pitch_Right")]
+        last_air = contact.data.last_air_time.torch[:, self._sensor_foot_ids].mean(dim=0)
+        log["Metrics/air_time_asymmetry"] = (last_air[0] - last_air[1]).abs() / (last_air.sum() + 1e-6)
+        in_contact = contact.data.current_contact_time.torch[:, self._sensor_foot_ids] > 0.0
+        log["Metrics/single_stance_frac"] = (in_contact.sum(dim=1) == 1).float().mean()
         log["Metrics/prismatic_target_rate_abs_mean"] = prismatic_term.target_rate.abs().mean()
         log["Metrics/command_planar_speed_mean"] = torch.linalg.norm(cmd[:, :2], dim=1).mean()
         extras["log"] = log
