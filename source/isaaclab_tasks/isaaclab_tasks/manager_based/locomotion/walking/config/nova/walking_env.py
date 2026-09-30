@@ -18,6 +18,7 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.common import VecEnvStepReturn
+from isaaclab.utils.math import quat_apply_inverse
 
 from .mdp.rewards import effort_sum_ratio_sq
 
@@ -28,6 +29,10 @@ class NovaWalkingEnv(ManagerBasedRLEnv):
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
         obs, rew, terminated, truncated, extras = super().step(action)
         robot = self.scene["robot"]
+        if not hasattr(self, "_foot_ids"):
+            names = robot.body_names
+            self._hip_base_id = names.index("Hip_Base")
+            self._foot_ids = [names.index("Feet_Pitch_Left"), names.index("Feet_Pitch_Right")]
         prismatic_term = self.action_manager.get_term("prismatic_vel")
         q = robot.data.joint_pos.torch[:, prismatic_term.joint_ids]  # order: Upper L, Upper R, Lower L, Lower R
         cmd = self.command_manager.get_command("base_velocity")
@@ -40,6 +45,10 @@ class NovaWalkingEnv(ManagerBasedRLEnv):
         # raw effort, visible even when effort_reward saturates at 0 or 1
         effort_cfg = self.reward_manager.get_term_cfg("effort_reward").params["asset_cfg"]
         log["Metrics/effort_sum_ratio_sq_mean"] = effort_sum_ratio_sq(self, effort_cfg).mean()
+        # horizontal distance between the feet in the base frame (standing ~0.21 m; run 1's split ~1.30 m)
+        pos, quat = robot.data.body_link_pos_w.torch, robot.data.body_link_quat_w.torch
+        d = quat_apply_inverse(quat[:, self._hip_base_id], pos[:, self._foot_ids[0]] - pos[:, self._foot_ids[1]])
+        log["Metrics/feet_separation_mean"] = torch.linalg.norm(d[:, :2], dim=1).mean()
         log["Metrics/prismatic_target_rate_abs_mean"] = prismatic_term.target_rate.abs().mean()
         log["Metrics/command_planar_speed_mean"] = torch.linalg.norm(cmd[:, :2], dim=1).mean()
         extras["log"] = log
