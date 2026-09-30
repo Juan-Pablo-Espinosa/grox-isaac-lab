@@ -13,7 +13,8 @@ from ..mdp.symmetry import compute_symmetric_states
 @configclass
 class NovaWalkingPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    # Long run (~4-5 h at 4096 envs: ~0.78 s/iter headless, ~1.24 s/iter while a 4-env viewer play session runs).
+    # Long run: ~1.02 s/iter at 4096 envs headless (symmetry augmentation, self-collisions, filtered contact sensors)
+    # -> ~4.2 h for 15000 iterations; slower while a viewer / remote-desktop session shares the GPU.
     max_iterations = 15000
     save_interval = 250
     experiment_name = "nova_walking"
@@ -33,8 +34,8 @@ class NovaWalkingPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         # History: 0.005 -> 0.001 after run 1's std climbed 1.0 -> 8.25 (effort term dead); 0.001 -> 0.003 after run 2
-        # collapsed to standing still at std 0.46 (too little exploration to find a gait).
-        entropy_coef=0.003,
+        # collapsed to standing still at std 0.46 (too little exploration to find a gait); 0.003 -> 0.0025 for run 4.
+        entropy_coef=0.0025,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,

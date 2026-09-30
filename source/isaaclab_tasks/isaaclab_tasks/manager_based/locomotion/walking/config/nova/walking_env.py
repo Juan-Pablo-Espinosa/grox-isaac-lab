@@ -57,6 +57,19 @@ class NovaWalkingEnv(ManagerBasedRLEnv):
         log["Metrics/air_time_asymmetry"] = (last_air[0] - last_air[1]).abs() / (last_air.sum() + 1e-6)
         in_contact = contact.data.current_contact_time.torch[:, self._sensor_foot_ids] > 0.0
         log["Metrics/single_stance_frac"] = (in_contact.sum(dim=1) == 1).float().mean()
+        # gait / morphology diagnostics
+        target = prismatic_term.processed_actions  # U_L, U_R, L_L, L_R
+        at_clamp = (target <= 0.0055) | (target >= 0.0945)
+        log["Metrics/prismatic_upper_at_clamp_frac"] = at_clamp[:, 0:2].float().mean()
+        log["Metrics/prismatic_lower_at_clamp_frac"] = at_clamp[:, 2:4].float().mean()
+        log["Metrics/flight_frac"] = (~in_contact).all(dim=1).float().mean()
+        log["Metrics/max_swing_time_mean"] = (
+            contact.data.current_air_time.torch[:, self._sensor_foot_ids].amax(dim=1).mean()
+        )
+        leg = self.scene["leg_contact"].data.force_matrix_w.torch
+        log["Metrics/leg_self_contact_frac"] = (
+            (torch.linalg.norm(leg, dim=-1) > 1.0).any(dim=2).any(dim=1).float().mean()
+        )
         log["Metrics/prismatic_target_rate_abs_mean"] = prismatic_term.target_rate.abs().mean()
         log["Metrics/command_planar_speed_mean"] = torch.linalg.norm(cmd[:, :2], dim=1).mean()
         extras["log"] = log

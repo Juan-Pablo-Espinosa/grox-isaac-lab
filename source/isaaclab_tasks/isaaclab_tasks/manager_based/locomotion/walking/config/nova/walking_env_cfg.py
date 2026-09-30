@@ -234,13 +234,11 @@ class RewardsCfg:
     )
     # Kept wired but disabled: a walking gait is not L/R position-symmetric at every instant.
     symmetry_reward = RewTerm(func=standing_rewards.symmetry_reward, weight=0.0, params={"asset_cfg": _REVOLUTE})
-    # Log-only term: RewardManager skips weight-0 terms entirely, so a tiny weight keeps it computed and logged
-    # (Episode_Reward/<term> = weight * mean episode sum; divide by the weight for the raw value).
-    # Leadscrew power sum|F*target_rate| [W] (0 when holding or pinned at a clamp); negative sign so scaling the
-    # weight up later penalizes.
+    # Leadscrew power sum|F*target_rate| [W] (0 when holding or pinned at a clamp). Weight = -0.25 / 3.543 W, the mean
+    # power of run 3's final STOCHASTIC policy (training-time target jitter), so that jitter costs ~0.25 per step.
     prismatic_power_reward = RewTerm(
         func=walking_rewards.prismatic_power_reward,
-        weight=-1.0e-6,
+        weight=-0.0706,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_PRISMATIC_JOINTS, preserve_order=True),
             "action_term_name": "prismatic_vel",
@@ -421,10 +419,11 @@ class NovaWalkingEnvCfg(NovaStandingEnvCfg):
         cmd.heading_command = False
         cmd.rel_heading_envs = 0.0
         cmd.rel_standing_envs = 0.1
-        cmd.resampling_time_range = (12.0, 15.0)
-        cmd.ranges.lin_vel_x = (-0.5, 1.0)
-        cmd.ranges.lin_vel_y = (-0.4, 0.4)
-        cmd.ranges.ang_vel_z = (-1.0, 1.0)
+        cmd.resampling_time_range = (8.0, 12.0)
+        # vy / wz ranges stay symmetric: required by the left-right mirror augmentation (mdp/symmetry.py)
+        cmd.ranges.lin_vel_x = (-0.8, 1.5)
+        cmd.ranges.lin_vel_y = (-0.6, 0.6)
+        cmd.ranges.ang_vel_z = (-1.5, 1.5)
         cmd.ranges.heading = None  # unused without heading control (avoids the command term's warning)
 
         self.episode_length_s = 20.0
