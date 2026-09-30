@@ -5,7 +5,9 @@
 
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg
+
+from ..mdp.symmetry import compute_symmetric_states
 
 
 @configclass
@@ -41,4 +43,9 @@ class NovaWalkingPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+        # Left-right mirror augmentation (rsl_rl built-in): every PPO minibatch is doubled with its mirror image, so the
+        # policy cannot prefer one stance leg (run 3 converged to a population-wide right-leg hop). Mirror loss off.
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True, use_mirror_loss=False, data_augmentation_func=compute_symmetric_states
+        ),
     )
