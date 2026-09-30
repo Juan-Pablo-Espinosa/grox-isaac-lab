@@ -267,7 +267,7 @@ class RewardsCfg:
     )
     flight = RewTerm(
         func=walking_rewards.flight_penalty,
-        weight=-2.0,
+        weight=-5.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=NOVA_FOOT_BODIES, preserve_order=True)},
     )
     max_swing = RewTerm(
