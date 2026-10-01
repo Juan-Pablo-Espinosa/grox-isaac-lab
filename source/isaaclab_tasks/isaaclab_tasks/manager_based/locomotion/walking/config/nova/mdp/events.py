@@ -76,13 +76,17 @@ def reset_nova_walking(
     pose_range: dict[str, tuple[float, float]],
     velocity_range: dict[str, tuple[float, float]],
     foot_body_names: list[str] | None = None,
+    lower_prismatic_range: tuple[float, float] | None = None,
+    prismatic_per_env: list[tuple[float, float]] | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ):
     """Reset joints and root.
 
     Joints:
       * revolute: default + U(revolute_offset_range), clamped to soft limits
-      * prismatic: U(prismatic_range), one sample per L/R pair (upper pair, lower pair)
+      * prismatic: U(prismatic_range), one sample per L/R pair (upper pair, lower pair); the lower pair uses
+        ``lower_prismatic_range`` if given. ``prismatic_per_env`` (one (q_up, q_low) [m] per env index) replaces the
+        sampling entirely (evaluation sweeps / teleop).
       * all joint velocities zero
     Root:
       * x/y/yaw from ``pose_range``, roll/pitch zero, velocities from ``velocity_range``
@@ -106,8 +110,12 @@ def reset_nova_walking(
     q[:, rev_ids] += math_utils.sample_uniform(*revolute_offset_range, (n, len(rev_ids)), dev)
     soft = asset.data.soft_joint_pos_limits.torch[env_ids]
     q[:, rev_ids] = q[:, rev_ids].clamp(soft[:, rev_ids, 0], soft[:, rev_ids, 1])
-    q_up = math_utils.sample_uniform(*prismatic_range, (n, 1), dev)
-    q_low = math_utils.sample_uniform(*prismatic_range, (n, 1), dev)
+    if prismatic_per_env is not None:
+        fixed = torch.tensor(prismatic_per_env, dtype=torch.float32, device=dev)[env_ids]
+        q_up, q_low = fixed[:, 0:1], fixed[:, 1:2]
+    else:
+        q_up = math_utils.sample_uniform(*prismatic_range, (n, 1), dev)
+        q_low = math_utils.sample_uniform(*(lower_prismatic_range or prismatic_range), (n, 1), dev)
     q[:, up_ids] = q_up.expand(n, len(up_ids))
     q[:, low_ids] = q_low.expand(n, len(low_ids))
     asset.write_joint_position_to_sim_index(position=q, env_ids=env_ids)

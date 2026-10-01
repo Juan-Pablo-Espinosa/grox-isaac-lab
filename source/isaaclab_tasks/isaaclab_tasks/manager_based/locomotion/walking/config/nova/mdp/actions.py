@@ -3,7 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Velocity-command action term for NOVA's leadscrew-driven prismatic (leg-length) joints.
+"""Action terms for NOVA's leadscrew-driven prismatic (leg-length) joints.
+
+:class:`PrismaticLengthAction` (current task): absolute desired length, rate-limited, with a morphology lock -- see
+its docstring. :class:`PrismaticVelocityAction` (runs 1-4, kept for loading their checkpoints) is described below.
 
 The real leadscrews (T12x8 4-start trapezoidal, bronze nut, driven directly by a RobStride 00) are
 non-backdrivable and speed-limited (~0.035-0.041 m/s at walking loads), so the policy does not command a
@@ -115,9 +118,10 @@ class PrismaticVelocityAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         a = actions.clamp(-1.0, 1.0)
-        q_prev = self._q_target
-        self._q_target = (q_prev + a * self._dq_max).clamp(self.cfg.q_min, self.cfg.q_max)
-        self._target_rate = (self._q_target - q_prev) / self._dt
+        q_prev = self._q_target.clone()
+        # in place, so the buffers stay normal tensors when stepped under torch.inference_mode
+        self._q_target[:] = (q_prev + a * self._dq_max).clamp(self.cfg.q_min, self.cfg.q_max)
+        self._target_rate[:] = (self._q_target - q_prev) / self._dt
 
     def apply_actions(self):
         self._asset.set_joint_position_target_index(target=self._q_target, joint_ids=self._joint_ids)
@@ -150,3 +154,80 @@ class PrismaticVelocityActionCfg(ActionTermCfg):
     """Lower clamp of the position target [m] (kept off the 0.0 hard stop)."""
     q_max: float = 0.095
     """Upper clamp of the position target [m] (kept off the 0.1 hard stop)."""
+
+
+class PrismaticLengthAction(PrismaticVelocityAction):
+    """Absolute leg-length command with the leadscrew rate limit, plus a per-episode morphology lock.
+
+    Each action is a normalized *desired length*; the position target moves toward it at most ``max_velocity``:
+
+        l_des = c + h * clip(a, -1, 1),   c = (q_min + q_max) / 2,  h = (q_max - q_min) / 2   (0.05 +/- 0.045 m)
+        q*_t  = q*_{t-1} + clip(l_des - q*_{t-1}, -max_velocity * dt, max_velocity * dt)
+
+    Unlike the velocity mode, a zero-mean action does not integrate into a drift toward a hard stop: noise around a
+    holds the target near c + h * a.
+
+    Morphology lock: at every reset an env is LOCKED with probability ``lock_fraction`` (or per ``lock_per_env``).
+    A locked env keeps its position targets at the reset sample for the whole episode (the 4 prismatic actions are
+    ignored, :attr:`target_rate` is 0); FREE envs follow their actions. :attr:`locked` is exposed for the observation
+    and the metrics.
+    """
+
+    cfg: PrismaticLengthActionCfg
+
+    def __init__(self, cfg: PrismaticLengthActionCfg, env: ManagerBasedEnv) -> None:
+        super().__init__(cfg, env)
+        self._center = 0.5 * (self.cfg.q_min + self.cfg.q_max)
+        self._half_range = 0.5 * (self.cfg.q_max - self.cfg.q_min)
+        self._locked = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._lock_per_env = None
+        if self.cfg.lock_per_env is not None:
+            if len(self.cfg.lock_per_env) != self.num_envs:
+                raise ValueError(f"lock_per_env has {len(self.cfg.lock_per_env)} entries for {self.num_envs} envs")
+            self._lock_per_env = torch.tensor(self.cfg.lock_per_env, dtype=torch.bool, device=self.device)
+
+    @property
+    def locked(self) -> torch.Tensor:
+        """Per-env morphology-lock flag, shape (num_envs,), bool."""
+        return self._locked
+
+    @property
+    def desired_length(self) -> torch.Tensor:
+        """Desired length decoded from the last action c + h * clip(a, -1, 1) [m], shape (num_envs, action_dim)."""
+        return self._center + self._half_range * self._raw_actions.clamp(-1.0, 1.0)
+
+    @property
+    def commanded_velocity(self) -> torch.Tensor:
+        """Rate the target is driven at this step [m/s] (same as :attr:`target_rate` in length mode)."""
+        return self._target_rate
+
+    def process_actions(self, actions: torch.Tensor):
+        self._raw_actions[:] = actions
+        q_prev = self._q_target.clone()
+        step = (self.desired_length - q_prev).clamp(-self._dq_max, self._dq_max)
+        step = torch.where(self._locked.unsqueeze(1), torch.zeros_like(step), step)
+        self._q_target[:] = (q_prev + step).clamp(self.cfg.q_min, self.cfg.q_max)
+        self._target_rate[:] = (self._q_target - q_prev) / self._dt
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        # re-anchors the target to the freshly reset joints (the lock keeps exactly this target)
+        super().reset(env_ids)
+        if env_ids is None or isinstance(env_ids, slice):
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        env_ids = torch.as_tensor(env_ids, device=self.device)
+        if self._lock_per_env is not None:
+            self._locked[env_ids] = self._lock_per_env[env_ids]
+        else:
+            self._locked[env_ids] = torch.rand(len(env_ids), device=self.device) < self.cfg.lock_fraction
+
+
+@configclass
+class PrismaticLengthActionCfg(PrismaticVelocityActionCfg):
+    """Configuration for :class:`PrismaticLengthAction`."""
+
+    class_type: type[ActionTerm] = PrismaticLengthAction
+
+    lock_fraction: float = 0.0
+    """Probability that an env is LOCKED for an episode (sampled at every reset)."""
+    lock_per_env: list[bool] | None = None
+    """Fixed lock flag per env index (overrides :attr:`lock_fraction`); length must equal the number of envs."""

@@ -9,6 +9,7 @@ Mirror = reflection through the robot's sagittal (x-z) plane, y -> -y:
   * polar (linear) vectors  (x, y, z) -> ( x, -y,  z): base_lin_vel, projected_gravity, imu_lin_acc
   * axial (angular) vectors (x, y, z) -> (-x,  y, -z): base_ang_vel, imu_ang_vel
   * velocity command (vx, vy, wz) -> (vx, -vy, -wz)
+  * scalar flags (morph_locked) are mirror-invariant
   * joints: Left <-> Right swap with a per-pair sign, R = s * L, measured by FK (pose of every right-leg body vs the
     mirrored left-leg body; wrong sign costs 16-1005 mm / 24-183 deg of error):
         Hip_Pitch -1, Hip_Roll -1, Upperleg_Yaw -1, Lowerleg_Pitch -1, Feet_Roll -1,
@@ -48,6 +49,7 @@ _VECTOR_TERMS = {
     "imu_ang_vel": _AXIAL,
     "velocity_commands": (1.0, -1.0, -1.0),
 }
+_INVARIANT_TERMS = {"morph_locked"}
 
 
 def _joint_map(names: list[str]) -> tuple[list[int], list[float]]:
@@ -77,6 +79,9 @@ def _maps(env) -> dict[str, torch.Tensor]:
             assert size == 3, f"{name}: expected 3 dims, got {size}"
             obs_perm += [off, off + 1, off + 2]
             obs_sign += list(_VECTOR_TERMS[name])
+        elif name in _INVARIANT_TERMS:
+            obs_perm += list(range(off, off + size))
+            obs_sign += [1.0] * size
         elif name in ("joint_pos", "joint_vel"):
             assert size == len(joint_names), f"{name}: {size} != {len(joint_names)} joints"
             p, s = _joint_map(joint_names)
@@ -102,7 +107,7 @@ def _maps(env) -> dict[str, torch.Tensor]:
 
 
 def mirror_policy_obs(env, obs: torch.Tensor) -> torch.Tensor:
-    """Mirror a (batch, 66) policy observation tensor."""
+    """Mirror a (batch, 67) policy observation tensor."""
     m = _maps(env)
     return obs[:, m["obs_perm"]] * m["obs_sign"]
 
