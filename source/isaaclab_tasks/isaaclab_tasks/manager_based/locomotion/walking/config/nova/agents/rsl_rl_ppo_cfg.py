@@ -34,8 +34,9 @@ class NovaWalkingPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         # History: 0.005 -> 0.001 after run 1's std climbed 1.0 -> 8.25 (effort term dead); 0.001 -> 0.003 after run 2
-        # collapsed to standing still at std 0.46 (too little exploration to find a gait); 0.003 -> 0.0025 for run 4.
-        entropy_coef=0.0025,
+        # collapsed to standing still at std 0.46 (too little exploration to find a gait); 0.003 -> 0.0025 for run 4;
+        # 0.0025 -> 0.002 for run 5.
+        entropy_coef=0.002,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,

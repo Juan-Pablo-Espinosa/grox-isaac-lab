@@ -22,6 +22,7 @@ import math
 import isaaclab.envs.mdp as mdp
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -37,11 +38,16 @@ from isaaclab_tasks.manager_based.locomotion.standing.config.nova.standing_env_c
 from isaaclab_tasks.manager_based.locomotion.standing.config.nova.standing_env_cfg import (
     EventsCfg as StandingEventsCfg,
 )
+from isaaclab_tasks.manager_based.locomotion.standing.config.nova.standing_env_cfg import (
+    ObservationsCfg as StandingObservationsCfg,
+)
 
 from .mdp import events as walking_events
+from .mdp import observations as walking_observations
+from .mdp import power as walking_power
 from .mdp import rewards as walking_rewards
 from .mdp import terminations as walking_terminations
-from .mdp.actions import PrismaticVelocityActionCfg
+from .mdp.actions import PrismaticLengthActionCfg, PrismaticVelocityActionCfg
 from .mdp.contact_sensor_cfg import NestedBodyContactSensorCfg
 
 NOVA_PRISMATIC_JOINTS = [
@@ -176,24 +182,44 @@ def nova_walking_actuators(prismatic_stiffness: float = NOVA_PRISMATIC_STIFFNESS
 ##
 
 
+# Fraction of envs whose leg lengths are LOCKED at the reset sample for a whole episode (prismatic actions ignored).
+# The other half chooses its leg lengths freely; the locked half forces the policy to walk well at every morphology,
+# so the free half's choice is an actual preference rather than the only gait it ever learned.
+NOVA_MORPH_LOCK_FRACTION = 0.5
+
+
 @configclass
 class ActionsCfg:
-    """16-D action: 12 revolute position targets, then 4 prismatic velocity commands.
+    """16-D action: 12 revolute position targets, then 4 absolute prismatic lengths (rate-limited).
 
     ActionManager concatenates terms in declaration order. ``joint_pos`` uses preserve_order=False, so its 12
-    entries follow articulation joint order; ``prismatic_vel`` preserves NOVA_PRISMATIC_JOINTS order.
+    entries follow articulation joint order; ``prismatic`` preserves NOVA_PRISMATIC_JOINTS order.
     """
 
     joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot", joint_names=NOVA_REVOLUTE_JOINTS, scale=0.25, use_default_offset=True
     )
-    prismatic_vel = PrismaticVelocityActionCfg(
+    # Runs 1-4 used PrismaticVelocityActionCfg (a velocity command integrated into the target): zero-mean exploration
+    # noise random-walks the target into a clamp, and run 4 sat at the 0.005 m stop ~93% of the time.
+    prismatic = PrismaticLengthActionCfg(
         asset_name="robot",
         joint_names=NOVA_PRISMATIC_JOINTS,
         max_velocity=NOVA_PRISMATIC_MAX_SPEED,
         q_min=0.005,
         q_max=0.095,
+        lock_fraction=NOVA_MORPH_LOCK_FRACTION,
     )
+
+
+@configclass
+class ObservationsCfg(StandingObservationsCfg):
+    """Standing's 66-D policy observation + the morphology-lock flag (index 66)."""
+
+    @configclass
+    class PolicyCfg(StandingObservationsCfg.PolicyCfg):
+        morph_locked = ObsTerm(func=walking_observations.morph_locked, params={"action_term_name": "prismatic"})
+
+    policy: PolicyCfg = PolicyCfg()
 
 
 _REVOLUTE = SceneEntityCfg("robot", joint_names=NOVA_REVOLUTE_JOINTS, preserve_order=True)
@@ -218,8 +244,9 @@ class RewardsCfg:
     # k = ln(2)/2.0: sum (tau/tau_lim)^2 = 2.0 earns 0.5 (stand p90 0.29 -> 0.904; run 1's saturated split at
     # 10.0 -> 0.031). History: 5.1782 (standing telemetry) was dead on walking torques (3e-23 at run 1's median);
     # 0.0693 (anchored on run 1's saturated median 10.0) barely separated moderate from low effort.
+    # OFF for run 5 (replaced by p_elec; kept wired so effort_sum_ratio_sq_mean is still logged).
     effort_reward = RewTerm(
-        func=walking_rewards.effort_reward, weight=3.0, params={"asset_cfg": _REVOLUTE, "k": NOVA_EFFORT_K}
+        func=walking_rewards.effort_reward, weight=0.0, params={"asset_cfg": _REVOLUTE, "k": NOVA_EFFORT_K}
     )
     # Stock joint_deviation_hip (joint_deviation_l1 on hip yaw + roll; H1 -0.2, G1 -0.1 vs a lin-vel tracking weight
     # of 1.0). -1.4 = H1's -0.2 x 7 (= G1's -0.1 x our 14x tracking weight). Targets splay exploits.
@@ -234,16 +261,20 @@ class RewardsCfg:
     )
     # Kept wired but disabled: a walking gait is not L/R position-symmetric at every instant.
     symmetry_reward = RewTerm(func=standing_rewards.symmetry_reward, weight=0.0, params={"asset_cfg": _REVOLUTE})
-    # Leadscrew power sum|F*target_rate| [W] (0 when holding or pinned at a clamp). Weight = -0.25 / 3.543 W, the mean
-    # power of run 3's final STOCHASTIC policy (training-time target jitter), so that jitter costs ~0.25 per step.
+    # OFF for run 5 (the leadscrews are part of p_elec). Was -0.0706 = -0.25 / 3.543 W (run 3's stochastic jitter).
     prismatic_power_reward = RewTerm(
         func=walking_rewards.prismatic_power_reward,
-        weight=-0.0706,
+        weight=0.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=NOVA_PRISMATIC_JOINTS, preserve_order=True),
-            "action_term_name": "prismatic_vel",
+            "action_term_name": "prismatic",
         },
     )
+    # Electrical power of all 16 motors [W] (mdp/power.py: RobStride datasheet copper loss + mechanical power, no
+    # regeneration). The only energy term, so leg length is priced by what it costs per metre at the motors.
+    # Weight = -2.0 / 161.2 W, the median P_elec of run 4 (model_14999, deterministic, 64 envs, 20 s) at 0.5 m/s
+    # forward (stand 38.5 W, 1.0 m/s 209.2 W): a typical 0.5 m/s step costs ~2.0.
+    p_elec = RewTerm(func=walking_power.electrical_power, weight=-0.0124, params={"action_term_name": "prismatic"})
     # Stock biped term (single-stance time capped at threshold, zero when ||cmd_xy|| <= 0.1). Weight 5.25 = 0.375 x
     # velocity_xy (14); stock ratios: H1/G1 rough 0.25, G1 flat 0.75, H1 flat 1.0. Raised from 1.75 (0.25 x 7)
     # after run 2 learned to stand still (air time ~0.0002).
@@ -374,6 +405,7 @@ class NovaWalkingEnvCfg(NovaStandingEnvCfg):
     """NOVA_LOWERBODY_V2 command-conditioned walking (16-DOF action)."""
 
     actions: ActionsCfg = ActionsCfg()
+    observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventsCfg = EventsCfg()
@@ -421,7 +453,8 @@ class NovaWalkingEnvCfg(NovaStandingEnvCfg):
         cmd.rel_standing_envs = 0.1
         cmd.resampling_time_range = (8.0, 12.0)
         # vy / wz ranges stay symmetric: required by the left-right mirror augmentation (mdp/symmetry.py)
-        cmd.ranges.lin_vel_x = (-0.8, 1.5)
+        # run 5: forward range 1.5 -> 2.0 m/s (no command curriculum; the installed source has none for velocity)
+        cmd.ranges.lin_vel_x = (-0.8, 2.0)
         cmd.ranges.lin_vel_y = (-0.6, 0.6)
         cmd.ranges.ang_vel_z = (-1.5, 1.5)
         cmd.ranges.heading = None  # unused without heading control (avoids the command term's warning)
@@ -439,3 +472,23 @@ class NovaWalkingEnvCfg_PLAY(NovaWalkingEnvCfg):
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
+
+
+def make_run4_compatible(env_cfg: NovaWalkingEnvCfg) -> NovaWalkingEnvCfg:
+    """Turn a current walking cfg into the observation/action interface of runs 1-4 (66-D obs, velocity action).
+
+    For loading old checkpoints (teleop / evaluation only): drops the morph_locked observation, swaps the prismatic
+    term back to :class:`PrismaticVelocityActionCfg` (no morphology lock) and restores run 4's forward command range
+    (-0.8, 1.5) m/s. Rewards stay as configured. Modifies ``env_cfg`` in place and returns it.
+    """
+    old = env_cfg.actions.prismatic
+    env_cfg.actions.prismatic = PrismaticVelocityActionCfg(
+        asset_name=old.asset_name,
+        joint_names=old.joint_names,
+        max_velocity=old.max_velocity,
+        q_min=old.q_min,
+        q_max=old.q_max,
+    )
+    env_cfg.observations.policy.morph_locked = None
+    env_cfg.commands.base_velocity.ranges.lin_vel_x = (-0.8, 1.5)
+    return env_cfg
