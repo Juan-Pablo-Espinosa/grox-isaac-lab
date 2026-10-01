@@ -12,6 +12,12 @@ Launch (newest run, latest checkpoint by default)::
 
     ./isaaclab.sh -p scripts/nova/teleop_walk.py --task Isaac-Walking-Nova-Play-v0 --visualizer newton
     #   [--checkpoint /path/model_N.pt | --load_run <run_dir_name> [--checkpoint model_N.pt]] [--num_envs N]
+    #   [--locked U | U,L | random]   spawn morphology-LOCKED envs (leg lengths fixed per episode) at U (upper and
+    #                                 lower) or U,L [m] in [0.005, 0.095], or at the training reset sample
+
+Checkpoints: run 5+ (67-D obs, absolute-length prismatic action) and runs 1-4 (66-D obs, velocity-mode action) are
+both loaded -- the interface is detected from the checkpoint's actor input size and the env is rebuilt to match
+(walking_env_cfg.make_run4_compatible). --locked needs a run 5+ checkpoint (older policies never saw the lock).
 
 Input: keys pressed in the NEWTON VIEWER window (read through the viewer's own key events / key-down state, so
 holding a key works) and, as a secondary channel, keys typed in the launching TERMINAL (raw tty, tap-to-increment).
@@ -26,7 +32,8 @@ Keys:
     M       toggle MANUAL leg length     [ / ]   manual target leg length -/+ 0.01 m (upper and lower together)
     C       toggle camera follow         G       help (terminal: also H)
 Holding I/K/J/L/U/O in the viewer keeps changing the target at 1 m/s^2 (yaw 2.5 rad/s^2); the applied command always
-ramps toward the target at that rate. Targets are clamped to the training ranges.
+ramps toward the target at that rate. Targets are clamped to the env's command ranges (read from the task cfg).
+MANUAL leg length overrides the 4 prismatic actions of FREE envs; LOCKED envs keep their lengths.
 """
 
 from __future__ import annotations
@@ -45,6 +52,12 @@ parser = argparse.ArgumentParser(description="Keyboard teleop for the NOVA walki
 parser.add_argument("--task", type=str, default="Isaac-Walking-Nova-Play-v0")
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--selftest", action="store_true", help="Run the scripted key-injection test and exit.")
+parser.add_argument(
+    "--locked",
+    type=str,
+    default=None,
+    help="Spawn morphology-LOCKED envs: 'U' or 'U,L' leg-length targets [m], or 'random' (training reset sample).",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -54,7 +67,6 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import atexit  # noqa: E402
-import importlib.metadata as metadata  # noqa: E402
 import math  # noqa: E402
 import select  # noqa: E402
 import signal  # noqa: E402
@@ -63,21 +75,20 @@ import threading  # noqa: E402
 import time  # noqa: E402
 import tty  # noqa: E402
 
-import gymnasium as gym  # noqa: E402
+import nova_common  # noqa: E402
 import torch  # noqa: E402
-from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 
 import isaaclab.utils.math as math_utils  # noqa: E402
-from isaaclab.utils.assets import retrieve_file_path  # noqa: E402
-
-from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg  # noqa: E402
 
 import isaaclab_tasks  # noqa: E402, F401
-from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg  # noqa: E402
-from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry  # noqa: E402
+from isaaclab_tasks.manager_based.locomotion.walking.config.nova.mdp.actions import PrismaticLengthAction  # noqa: E402
+from isaaclab_tasks.manager_based.locomotion.walking.config.nova.walking_env_cfg import (  # noqa: E402
+    make_run4_compatible,
+)
+from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
-# training command ranges of Isaac-Walking-Nova-v0 (walking_env_cfg.py)
-RANGES = {"vx": (-0.8, 1.5), "vy": (-0.6, 0.6), "wz": (-1.5, 1.5)}
+# command clamps, filled from the env's command cfg ranges in main()
+RANGES: dict[str, tuple[float, float]] = {}
 STEP = {"vx": 0.1, "vy": 0.1, "wz": 0.25}
 RATE = {"vx": 1.0, "vy": 1.0, "wz": 2.5}  # ramp [unit/s]: 1 m/s^2 linear, 2.5 rad/s^2 yaw
 AXIS_KEYS = {"i": ("vx", +1), "k": ("vx", -1), "j": ("vy", +1), "l": ("vy", -1), "u": ("wz", +1), "o": ("wz", -1)}
@@ -224,37 +235,54 @@ class ViewerKeys:
         self.viz._apply_camera_pose((eye, target))
 
 
+def parse_locked(text: str | None) -> tuple[float, float] | str | None:
+    """--locked value -> (upper, lower) [m], 'random', or None."""
+    if text is None or text == "random":
+        return text
+    vals = [float(x) for x in text.split(",")]
+    if len(vals) not in (1, 2) or not all(LEG_MIN - 1e-9 <= x <= LEG_MAX + 1e-9 for x in vals):
+        raise SystemExit(f"--locked expects U or U,L in [{LEG_MIN}, {LEG_MAX}] m, or 'random'; got {text!r}")
+    return vals[0], vals[-1]
+
+
 def main():
+    locked = parse_locked(args_cli.locked)
+    # ---- policy checkpoint (same resolution as scripts/reinforcement_learning/rsl_rl/play_rsl_rl.py) and interface
+    agent_cfg, resume_path = nova_common.resolve_agent_and_checkpoint(args_cli.task, args_cli, cli_args)
+    legacy = nova_common.checkpoint_obs_dim(resume_path) == nova_common.LEGACY_OBS_DIM
+    if legacy and locked is not None:
+        raise SystemExit(
+            "[teleop] --locked needs a run-5+ checkpoint (67-D observation with the morph_locked flag); "
+            f"{resume_path} is a runs 1-4 policy (66-D, velocity-mode leg action) that never saw a locked morphology."
+        )
+
     # ---- env cfg (teleop: no resampling, no standing envs, no time-out; falls still reset)
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
-    cmd_cfg = env_cfg.commands.base_velocity
-    cmd_cfg.resampling_time_range = (1.0e9, 1.0e9)
-    cmd_cfg.rel_standing_envs = 0.0
-    cmd_cfg.heading_command = False
-    env_cfg.terminations.time_out = None
-
-    # ---- policy loading: same calls as scripts/reinforcement_learning/rsl_rl/play_rsl_rl.py
-    train_task = args_cli.task.split(":")[-1].replace("-Play", "")
-    agent_cfg = load_cfg_from_registry(train_task, "rsl_rl_cfg_entry_point")
-    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, metadata.version("rsl-rl-lib"))
-    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
-    if args_cli.checkpoint and os.path.isfile(args_cli.checkpoint):
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+    nova_common.pin_commands(env_cfg)
+    if legacy:
+        make_run4_compatible(env_cfg)
+        print("[teleop] runs 1-4 checkpoint (66-D obs): velocity-mode leg action, no morphology lock")
     else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    env = gym.make(args_cli.task, cfg=env_cfg)
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    runner.load(resume_path)
-    policy = runner.get_inference_policy(device=env.unwrapped.device)  # deterministic (mean actions)
+        env_cfg.actions.prismatic.lock_fraction = 1.0 if locked is not None else 0.0
+        if isinstance(locked, tuple):
+            env_cfg.events.reset_nova.params["prismatic_range"] = (locked[0], locked[0])
+            env_cfg.events.reset_nova.params["lower_prismatic_range"] = (locked[1], locked[1])
+        if locked is not None:
+            print(
+                f"[teleop] morphology LOCKED: {locked if isinstance(locked, str) else f'U {locked[0]} L {locked[1]} m'}"
+            )
+    r = env_cfg.commands.base_velocity.ranges
+    RANGES.update(vx=tuple(r.lin_vel_x), vy=tuple(r.lin_vel_y), wz=tuple(r.ang_vel_z))
+    print(f"[teleop] command clamps (env cfg): {RANGES}")
+    env, policy = nova_common.make_env_and_policy(args_cli.task, env_cfg, agent_cfg, resume_path)
 
     u = env.unwrapped
     dev, n = u.device, u.num_envs
     robot, contact = u.scene["robot"], u.scene["contact_forces"]
     cmd_term = u.command_manager.get_term("base_velocity")
-    prismatic = u.action_manager.get_term("prismatic_vel")
+    prismatic = u.action_manager.get_term("prismatic")
+    length_mode = isinstance(prismatic, PrismaticLengthAction)
+    lock_flags = getattr(prismatic, "locked", torch.zeros(n, dtype=torch.bool, device=dev))
     foot_ids = [contact.body_names.index(b) for b in ("Feet_Pitch_Left", "Feet_Pitch_Right")]
     teleop = Teleop()
     cmd_vec = torch.zeros(n, 3, device=dev)
@@ -264,7 +292,7 @@ def main():
         cmd_term.vel_command_b[:] = cmd_vec
 
     # a fall-reset resamples the command; route that to the teleop command instead of a random one
-    cmd_term._resample_command = lambda env_ids: cmd_term.vel_command_b.__setitem__(env_ids, cmd_vec[env_ids])
+    nova_common.route_resample(u, cmd_vec)
 
     viewer_keys = ViewerKeys(u.sim, teleop)
     term_keys = TerminalKeys(teleop) if not args_cli.selftest else None
@@ -311,10 +339,15 @@ def main():
             with torch.inference_mode():
                 actions = policy(obs)
                 if teleop.manual:
-                    # override the 4 prismatic velocity commands: drive the integrated target toward the manual leg
-                    # length; the action term still clips to [-1, 1] -> <= 0.035 m/s and clamps to [0.005, 0.095]
-                    err = teleop.leg - prismatic.processed_actions
-                    actions[:, -4:] = (err / (prismatic.cfg.max_velocity * dt)).clamp(-1.0, 1.0)
+                    pc = prismatic.cfg
+                    if length_mode:
+                        # absolute-length action: a = (l - c) / h; the term rate-limits the target to 0.035 m/s
+                        c, h = 0.5 * (pc.q_min + pc.q_max), 0.5 * (pc.q_max - pc.q_min)
+                        actions[:, -4:] = (teleop.leg - c) / h
+                    else:
+                        # velocity-mode action (runs 1-4): drive the integrated target toward the manual length
+                        err = teleop.leg - prismatic.processed_actions
+                        actions[:, -4:] = (err / (pc.max_velocity * dt)).clamp(-1.0, 1.0)
             obs, _, dones, extras = env.step(actions)
             time_outs = extras.get("time_outs", torch.zeros_like(dones)).bool()
             falls += int((dones.bool() & ~time_outs).sum())  # time_out is disabled, so every done is a fall
@@ -331,13 +364,18 @@ def main():
                 w = robot.data.root_ang_vel_b.torch[0, 2]
                 q = robot.data.joint_pos.torch[0, prismatic.joint_ids] * 1000
                 inc = contact.data.current_contact_time.torch[0, foot_ids] > 0
+                mode = "AUTO"
+                if lock_flags[0]:
+                    mode = "LOCKED"
+                elif teleop.manual:
+                    mode = f"MANUAL {teleop.leg * 1000:.0f}mm"
                 sys.stdout.write(
                     f"\r\033[Kcmd ({teleop.cmd['vx']:+.2f},{teleop.cmd['vy']:+.2f},{teleop.cmd['wz']:+.2f}) "
                     f"tgt ({teleop.target['vx']:+.2f},{teleop.target['vy']:+.2f},{teleop.target['wz']:+.2f}) | "
                     f"body ({v[0]:+.2f},{v[1]:+.2f},{w:+.2f}) | "
                     f"leg mm U {q[0]:.0f}/{q[1]:.0f} L {q[2]:.0f}/{q[3]:.0f} | "
                     f"feet {'L' if inc[0] else '-'}{'R' if inc[1] else '-'} | "
-                    f"{'MANUAL ' + str(round(teleop.leg * 1000)) + 'mm' if teleop.manual else 'AUTO'} | falls {falls}"
+                    f"{mode} | falls {falls}"
                 )
                 sys.stdout.flush()
             # real-time pacing (the viewer would otherwise run the robot faster than wall clock)
@@ -407,12 +445,10 @@ class SelfTest:
             self.leg_start = q.tolist()
             self.t.leg = 0.05
         elif t < 24.0:
-            tq = prismatic.processed_actions[0].clone()
             if self.prev_q is not None:
                 self.log["leg_rate"].append(((q - self.prev_q).abs().max() / u.step_dt).item())
-            if self.prev_t is not None:
-                self.log["tgt_rate"].append(((tq - self.prev_t).abs().max() / u.step_dt).item())
-            self.prev_t = tq
+            # the term's own rate (zeroed on reset, so a fall-reset re-anchoring is not counted as motion)
+            self.log["tgt_rate"].append(prismatic.target_rate[0].abs().max().item())
             self.log["leg"] = q.tolist()
         elif t < 24.1:
             self.t.key("r")
