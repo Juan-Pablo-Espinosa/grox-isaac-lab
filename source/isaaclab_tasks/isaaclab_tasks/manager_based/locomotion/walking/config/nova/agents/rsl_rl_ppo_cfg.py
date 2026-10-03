@@ -51,3 +51,12 @@ class NovaWalkingPPORunnerCfg(RslRlOnPolicyRunnerCfg):
             use_data_augmentation=True, use_mirror_loss=False, data_augmentation_func=compute_symmetric_states
         ),
     )
+
+
+@configclass
+class NovaMorphAgnosticPPORunnerCfg(NovaWalkingPPORunnerCfg):
+    """Morphology-agnostic task: run 4's PPO settings (entropy 0.0025), own experiment folder."""
+
+    experiment_name = "nova_morph_agnostic"
+    # run 4's entropy (the walking task moved to 0.002 for run 5); everything else identical, incl. symmetry
+    algorithm = NovaWalkingPPORunnerCfg().algorithm.replace(entropy_coef=0.0025)
