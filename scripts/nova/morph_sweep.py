@@ -7,10 +7,17 @@
 
 Launch (headless)::
 
-    ./isaaclab.sh -p scripts/nova/morph_sweep.py --checkpoint logs/rsl_rl/nova_walking/<run>/model_N.pt --headless
-    #   [--envs_per_cell 32] [--free_envs_per_speed 64] [--settle 3] [--duration 15] [--out DIR]
+    # morphology-agnostic task (default): every cell's leg length is held by the external prismatic driver
+    ./isaaclab.sh -p scripts/nova/morph_sweep.py --checkpoint logs/rsl_rl/nova_morph_agnostic/<run>/model_N.pt \
+        --headless   # speeds {0, 0.5, 1, 1.5, 2, 2.5}
+    # walking task run 5+ (LOCKED grid + FREE choice, see below)
+    ./isaaclab.sh -p scripts/nova/morph_sweep.py --task Isaac-Walking-Nova-Play-v0 --checkpoint <run 5 model> --headless
+    #   [--envs_per_cell 32] [--free_envs_per_speed 64] [--settle 3] [--duration 15] [--speeds ...] [--out DIR]
 
-All cells run in ONE simulation, side by side:
+Morphology-agnostic task: grid upper q x lower q x forward speed, ``--envs_per_cell`` envs per cell, the random
+schedule off and each env's driver goal = its cell's lengths (falls respawn at the same lengths). No FREE block.
+
+Walking task, all cells run in ONE simulation, side by side:
   * LOCKED block: grid upper q x lower q in {0.005, 0.035, 0.065, 0.095} m x forward speed {0, 0.5, 1.0, 1.5, 2.0}
     m/s, ``--envs_per_cell`` envs per cell; leg lengths held at the cell values (falls respawn at the same values).
   * FREE block: the same speeds, ``--free_envs_per_speed`` envs each, the policy chooses its leg lengths (respawn
@@ -21,7 +28,8 @@ the statistics from then on. Deterministic policy, no observation noise, no push
 Per cell (samples pooled over the cell's surviving env-steps): actual speed (planar |v_xy| and forward v_x in the
 base frame), tracking error |v_xy - cmd_xy|, falls, P_elec (mdp/power.py), CoT = mean P_elec / (m g max(mean |v|,
 0.1)) with m the mean robot mass of the cell, single-stance and flight fractions. FREE rows also give the chosen q_U,
-q_L (mean / std over env-steps of the last 5 s).
+q_L (mean / std over env-steps of the last 5 s). Every row also has step_freq (touchdowns of both feet per second
+of surviving env time) [Hz] and stride_length (distance per two touchdowns) [m].
 
 Outputs in ``--out`` (default: <checkpoint dir>/morph_sweep_<checkpoint name>/): sweep.csv, cot_heatmaps.png (one
 CoT heatmap per speed, the FREE choice marked), optimal_length.png (lowest-CoT locked total length vs speed, with the
@@ -40,14 +48,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import cli_args  # noqa: E402
 
 parser = argparse.ArgumentParser(description="Leg-length x speed sweep of a NOVA walking policy.")
-parser.add_argument("--task", type=str, default="Isaac-Walking-Nova-Play-v0")
+parser.add_argument("--task", type=str, default="Isaac-Walking-Nova-MorphAgnostic-Play-v0")
 parser.add_argument("--envs_per_cell", type=int, default=32)
 parser.add_argument("--free_envs_per_speed", type=int, default=64)
 parser.add_argument("--settle", type=float, default=3.0, help="Seconds before measuring [s].")
 parser.add_argument("--duration", type=float, default=15.0, help="Measurement time [s].")
 parser.add_argument("--free_window", type=float, default=5.0, help="FREE leg-length window at the end [s].")
 parser.add_argument("--lengths", type=str, default="0.005,0.035,0.065,0.095")
-parser.add_argument("--speeds", type=str, default="0,0.5,1.0,1.5,2.0")
+parser.add_argument("--speeds", type=str, default=None, help="Default 0..2.5 (agnostic) / 0..2.0 (walking).")
 parser.add_argument("--out", type=str, default=None)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -63,21 +71,24 @@ import nova_common  # noqa: E402
 import torch  # noqa: E402
 
 import isaaclab_tasks  # noqa: E402, F401
-from isaaclab_tasks.manager_based.locomotion.walking.config.nova.mdp.power import power_model  # noqa: E402
+from isaaclab_tasks.manager_based.locomotion.walking.config.nova.mdp.power import (  # noqa: E402
+    PRISMATIC_DRIVER,
+    power_model,
+)
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 G = 9.81
 
 
-def build_layout(lengths: list[float], speeds: list[float], e_cell: int, e_free: int):
+def build_layout(lengths: list[float], speeds: list[float], e_cell: int, e_free: int, mode: str = "locked"):
     """Per-env cell assignment: lists of (mode, speed, q_up, q_low) per cell and the per-env cell index."""
     cells, env_cell = [], []
     for v in speeds:
         for qu in lengths:
             for ql in lengths:
-                cells.append(("locked", v, qu, ql))
+                cells.append((mode, v, qu, ql))
                 env_cell += [len(cells) - 1] * e_cell
-    for v in speeds:
+    for v in speeds if e_free else []:
         cells.append(("free", v, float("nan"), float("nan")))
         env_cell += [len(cells) - 1] * e_free
     return cells, env_cell
@@ -85,33 +96,49 @@ def build_layout(lengths: list[float], speeds: list[float], e_cell: int, e_free:
 
 def main():
     lengths = [float(x) for x in args_cli.lengths.split(",")]
-    speeds = [float(x) for x in args_cli.speeds.split(",")]
     agent_cfg, resume_path = nova_common.resolve_agent_and_checkpoint(args_cli.task, args_cli, cli_args)
-    if nova_common.checkpoint_obs_dim(resume_path) == nova_common.LEGACY_OBS_DIM:
-        raise SystemExit(f"[sweep] {resume_path} is a runs 1-4 policy (66-D obs, no morphology lock): not supported.")
-    cells, env_cell = build_layout(lengths, speeds, args_cli.envs_per_cell, args_cli.free_envs_per_speed)
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
+    agnostic = hasattr(env_cfg, "prismatic_driver")
+    act_dim = nova_common.checkpoint_action_dim(resume_path)
+    if agnostic and act_dim != 12:
+        raise SystemExit(
+            f"[sweep] {args_cli.task} needs a 12-D (morphology-agnostic) policy; {resume_path} is {act_dim}-D."
+        )
+    if not agnostic and (act_dim != 16 or nova_common.checkpoint_obs_dim(resume_path) == nova_common.LEGACY_OBS_DIM):
+        raise SystemExit(
+            f"[sweep] {resume_path} is not a walking run-5+ policy (67-D obs, 16-D action): not supported."
+        )
+    speeds = [
+        float(x) for x in (args_cli.speeds or ("0,0.5,1.0,1.5,2.0,2.5" if agnostic else "0,0.5,1.0,1.5,2.0")).split(",")
+    ]
+    e_free = 0 if agnostic else args_cli.free_envs_per_speed
+    cells, env_cell = build_layout(lengths, speeds, args_cli.envs_per_cell, e_free, "driven" if agnostic else "locked")
     n = len(env_cell)
     gen = torch.Generator().manual_seed(0)
     free_len = (0.005 + 0.09 * torch.rand(n, 2, generator=gen)).tolist()  # FREE respawn lengths (fixed per env)
     per_env_len = [
-        (cells[c][2], cells[c][3]) if cells[c][0] == "locked" else tuple(free_len[i]) for i, c in enumerate(env_cell)
+        (cells[c][2], cells[c][3]) if cells[c][0] != "free" else tuple(free_len[i]) for i, c in enumerate(env_cell)
     ]
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=n)
     nova_common.pin_commands(env_cfg)
     env_cfg.events.base_external_force_torque = None
     env_cfg.observations.policy.enable_corruption = False
-    env_cfg.actions.prismatic.lock_per_env = [cells[c][0] == "locked" for c in env_cell]
+    if agnostic:
+        env_cfg.prismatic_driver.schedule_enabled = False  # driver goal = respawn length = the cell's length
+    else:
+        env_cfg.actions.prismatic.lock_per_env = [cells[c][0] == "locked" for c in env_cell]
     env_cfg.events.reset_nova.params["prismatic_per_env"] = per_env_len
     print(
-        f"[sweep] {len(cells)} cells, {n} envs ({args_cli.envs_per_cell}/locked cell, "
-        f"{args_cli.free_envs_per_speed}/free speed)"
+        f"[sweep] {'agnostic' if agnostic else 'walking'}: {len(cells)} cells, {n} envs ({args_cli.envs_per_cell}/cell"
+        f"{'' if agnostic else f', {e_free}/free speed'})"
     )
     env, policy = nova_common.make_env_and_policy(args_cli.task, env_cfg, agent_cfg, resume_path)
     u = env.unwrapped
     dev = u.device
     robot, contact = u.scene["robot"], u.scene["contact_forces"]
-    prismatic = u.action_manager.get_term("prismatic")
+    prismatic = u.prismatic_driver if agnostic else u.action_manager.get_term("prismatic")
+    rate_source = PRISMATIC_DRIVER if agnostic else "prismatic"
     foot_ids = [contact.body_names.index(b) for b in ("Feet_Pitch_Left", "Feet_Pitch_Right")]
     cell_of = torch.tensor(env_cell, device=dev)
     cmd_vec = torch.zeros(n, 3, device=dev)
@@ -123,10 +150,11 @@ def main():
     dt = u.step_dt
     settle, total = int(args_cli.settle / dt), int((args_cli.settle + args_cli.duration) / dt)
     window = total - int(args_cli.free_window / dt)
-    keys = ("n", "speed", "vx", "err", "p", "ss", "flight", "n_w", "qu", "qu2", "ql", "ql2")
+    keys = ("n", "speed", "vx", "err", "p", "ss", "flight", "touch", "n_w", "qu", "qu2", "ql", "ql2")
     acc = {k: torch.zeros(n, device=dev) for k in keys}
     alive = torch.ones(n, dtype=torch.bool, device=dev)
     fall_events = torch.zeros(n, device=dev)
+    prev_contact = torch.zeros(n, 2, dtype=torch.bool, device=dev)
     with torch.inference_mode():
         cmd_term.vel_command_b[:] = cmd_vec
         obs, _ = env.reset()
@@ -139,8 +167,13 @@ def main():
                 continue
             m = alive.float()
             v_b = robot.data.root_lin_vel_b.torch[:, :2]
-            p_elec = power_model(u, "prismatic").compute(u)[0].sum(dim=1)
+            p_elec = power_model(u, rate_source).compute(u)[0].sum(dim=1)
             in_contact = contact.data.current_contact_time.torch[:, foot_ids] > 0.0
+            touchdowns = (in_contact & ~prev_contact).sum(dim=1).float()
+            prev_contact = in_contact
+            if step == settle:  # first measured step: only initialise the contact state
+                touchdowns = torch.zeros_like(touchdowns)
+            acc["touch"] += m * touchdowns
             acc["n"] += m
             acc["speed"] += m * torch.linalg.norm(v_b, dim=1)
             acc["vx"] += m * v_b[:, 0]
@@ -181,6 +214,8 @@ def main():
             "cot": p_mean / (mass[sel].mean().item() * G * max(speed, 0.1)) if s["n"] else float("nan"),
             "single_stance": s["ss"] / nn if s["n"] else float("nan"),
             "flight": s["flight"] / nn if s["n"] else float("nan"),
+            "step_freq": s["touch"] / (nn * dt) if s["n"] else float("nan"),
+            "stride_length": s["speed"] * dt / (s["touch"] / 2.0) if s["touch"] >= 2 else float("nan"),
             "q_upper_std": float("nan"),
             "q_lower_std": float("nan"),
         }
@@ -212,10 +247,7 @@ def best_locked(rows, v):
     ok = [
         r
         for r in rows
-        if r["mode"] == "locked"
-        and r["speed_cmd"] == v
-        and not math.isnan(r["cot"])
-        and r["n_fell"] <= 0.5 * r["n_envs"]
+        if r["mode"] != "free" and r["speed_cmd"] == v and not math.isnan(r["cot"]) and r["n_fell"] <= 0.5 * r["n_envs"]
     ]
     return min(ok, key=lambda r: r["cot"]) if ok else None
 
@@ -230,13 +262,13 @@ def plot(rows, lengths, speeds, out):
     k = len(lengths)
     fig, axes = plt.subplots(1, len(speeds), figsize=(4.8 * len(speeds), 4.6), squeeze=False)
     fig.subplots_adjust(wspace=0.38)
-    finite = [r["cot"] for r in rows if r["mode"] == "locked" and math.isfinite(r["cot"])]
+    finite = [r["cot"] for r in rows if r["mode"] != "free" and math.isfinite(r["cot"])]
     vmin, vmax = (min(finite), max(finite)) if finite else (0.0, 1.0)
     ext = [lengths[0] - 0.015, lengths[-1] + 0.015, lengths[0] - 0.015, lengths[-1] + 0.015]
     for ax, v in zip(axes[0], speeds):
         grid = np.full((k, k), np.nan)  # [lower, upper]
         for r in rows:
-            if r["mode"] == "locked" and r["speed_cmd"] == v:
+            if r["mode"] != "free" and r["speed_cmd"] == v:
                 grid[lengths.index(r["q_lower"]), lengths.index(r["q_upper"])] = r["cot"]
                 ax.text(
                     r["q_upper"],
@@ -264,8 +296,11 @@ def plot(rows, lengths, speeds, out):
         best = best_locked(rows, v)
         if best:
             ax.plot(best["q_upper"], best["q_lower"], "s", mfc="none", mec="r", ms=26, mew=2)
-        free_txt = f"FREE * CoT {free['cot']:.2f}" if free and math.isfinite(free["cot"]) else "FREE: n/a"
-        ax.set_title(f"cmd vx {v:.1f} m/s | {free_txt}\n(red square: lowest-CoT locked, nF = falls)", fontsize=9)
+        has_free = any(r["mode"] == "free" for r in rows)
+        free_txt = ""
+        if has_free:
+            free_txt = f" | FREE * CoT {free['cot']:.2f}" if free and math.isfinite(free["cot"]) else " | FREE: n/a"
+        ax.set_title(f"cmd vx {v:.1f} m/s{free_txt}\n(red square: lowest-CoT cell, nF = falls)", fontsize=9)
         ax.set_xlabel("upper prismatic q [m]")
         ax.set_ylabel("lower prismatic q [m]")
         ax.set_xticks(lengths)
@@ -277,7 +312,7 @@ def plot(rows, lengths, speeds, out):
     fig, ax = plt.subplots(figsize=(6, 4))
     bv = [(v, best_locked(rows, v)) for v in speeds]
     bv = [(v, b) for v, b in bv if b]
-    ax.plot([v for v, _ in bv], [b["total_q"] for _, b in bv], "s-", label="lowest-CoT LOCKED cell (q_U + q_L)")
+    ax.plot([v for v, _ in bv], [b["total_q"] for _, b in bv], "s-", label="lowest-CoT cell (q_U + q_L)")
     fr = [r for r in rows if r["mode"] == "free" and math.isfinite(r["total_q"])]
     ax.errorbar(
         [r["speed_cmd"] for r in fr],
@@ -298,23 +333,27 @@ def plot(rows, lengths, speeds, out):
 
 
 def print_summary(rows, speeds):
-    print("\n=== MORPH SWEEP (locked: best cell; free: chosen lengths)")
+    print("\n=== MORPH SWEEP (grid: lowest-CoT cell; free (walking task): chosen lengths)")
     for v in speeds:
         b = best_locked(rows, v)
-        locked = [r for r in rows if r["mode"] == "locked" and r["speed_cmd"] == v]
+        locked = [r for r in rows if r["mode"] != "free" and r["speed_cmd"] == v]
         fell = sum(r["n_fell"] for r in locked)
         n = sum(r["n_envs"] for r in locked)
-        fr = next(r for r in rows if r["mode"] == "free" and r["speed_cmd"] == v)
+        fr = next((r for r in rows if r["mode"] == "free" and r["speed_cmd"] == v), None)
         btxt = (
-            f"best U {b['q_upper']:.3f} L {b['q_lower']:.3f} CoT {b['cot']:.3f} (v {b['speed_actual']:.2f})"
+            f"best U {b['q_upper']:.3f} L {b['q_lower']:.3f} CoT {b['cot']:.3f} (v {b['speed_actual']:.2f}, "
+            f"{b['step_freq']:.2f} Hz, stride {b['stride_length']:.3f} m)"
             if b
-            else "no locked cell with <= 50% falls"
+            else "no cell with <= 50% falls"
         )
-        print(
-            f"  v {v:.1f}: locked falls {fell}/{n}; {btxt} | FREE U {fr['q_upper']:.4f}+/-{fr['q_upper_std']:.4f} "
-            f"L {fr['q_lower']:.4f}+/-{fr['q_lower_std']:.4f} CoT {fr['cot']:.3f} v {fr['speed_actual']:.2f} "
-            f"err {fr['track_err']:.2f} falls {fr['n_fell']}/{fr['n_envs']}"
+        ftxt = (
+            f" | FREE U {fr['q_upper']:.4f}+/-{fr['q_upper_std']:.4f} L {fr['q_lower']:.4f}+/-{fr['q_lower_std']:.4f} "
+            f"CoT {fr['cot']:.3f} v {fr['speed_actual']:.2f} err {fr['track_err']:.2f} "
+            f"falls {fr['n_fell']}/{fr['n_envs']}"
+            if fr
+            else ""
         )
+        print(f"  v {v:.1f}: grid falls {fell}/{n}; {btxt}{ftxt}")
 
 
 if __name__ == "__main__":
