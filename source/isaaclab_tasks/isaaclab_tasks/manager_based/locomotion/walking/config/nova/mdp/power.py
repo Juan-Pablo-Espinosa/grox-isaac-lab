@@ -55,6 +55,13 @@ class MotorSpec:
     """Peak output torque [N·m]."""
     rated_speed_rpm: float
     """Output speed at rated torque [rpm]."""
+    no_load_speed_rpm: float = float("nan")
+    """Output no-load speed at 48 V [rpm] (the module's maximum speed)."""
+
+    @property
+    def no_load_speed(self) -> float:
+        """Output no-load speed [rad/s]."""
+        return self.no_load_speed_rpm * 2.0 * math.pi / 60.0
 
     @property
     def rated_power(self) -> float:
@@ -66,11 +73,11 @@ class MotorSpec:
 # published: estimated from the rated copper loss per module mass of the three models that publish R (RS02 53, RS03
 # 48, RS04 62 W/kg -> mean 54 W/kg): R = 54 * mass / (1.5 * I_rated_rms^2).
 ROBSTRIDE = {
-    "RS00": MotorSpec(kt=1.48, r_terminal=1.0, rated_torque=5.0, peak_torque=14.0, rated_speed_rpm=100.0),  # R estimate
-    "RS02": MotorSpec(kt=1.22, r_terminal=0.58, rated_torque=6.0, peak_torque=17.0, rated_speed_rpm=360.0),
-    "RS03": MotorSpec(kt=2.36, r_terminal=0.39, rated_torque=20.0, peak_torque=60.0, rated_speed_rpm=180.0),
-    "RS04": MotorSpec(kt=2.1, r_terminal=0.16, rated_torque=40.0, peak_torque=120.0, rated_speed_rpm=167.0),
-    "RS06": MotorSpec(kt=1.09, r_terminal=0.22, rated_torque=11.0, peak_torque=36.0, rated_speed_rpm=100.0),  # R est.
+    "RS00": MotorSpec(1.48, 1.0, 5.0, 14.0, rated_speed_rpm=100.0, no_load_speed_rpm=315.0),  # R estimate
+    "RS02": MotorSpec(1.22, 0.58, 6.0, 17.0, rated_speed_rpm=360.0, no_load_speed_rpm=410.0),
+    "RS03": MotorSpec(2.36, 0.39, 20.0, 60.0, rated_speed_rpm=180.0, no_load_speed_rpm=195.0),
+    "RS04": MotorSpec(2.1, 0.16, 40.0, 120.0, rated_speed_rpm=167.0, no_load_speed_rpm=200.0),
+    "RS06": MotorSpec(1.09, 0.22, 11.0, 36.0, rated_speed_rpm=100.0, no_load_speed_rpm=480.0),  # R estimate
 }
 LEADSCREW_LEAD = 0.008
 """T12x8 lead [m/rev]."""
@@ -106,6 +113,31 @@ MOTOR_GROUPS = {
 }
 """Group label prefix -> motor model (for breakdowns)."""
 
+DASHBOARD_GROUPS = ("hip_knee", "roll", "yaw", "ankle", "leadscrew")
+"""Coarse motor groups for dashboards / recordings / metrics."""
+
+
+def dashboard_group(label: str) -> str:
+    """Coarse group of a motor label (see :data:`DASHBOARD_GROUPS`)."""
+    if label.startswith(("hip_pitch", "knee")):
+        return "hip_knee"
+    if label.startswith("hip_roll"):
+        return "roll"
+    if label.startswith("hip_yaw"):
+        return "yaw"
+    if label.startswith("ankle"):
+        return "ankle"
+    return "leadscrew"
+
+
+PRISMATIC_DRIVER = "prismatic_driver"
+"""Pass as ``action_term_name`` to take the leadscrew rate from the env's external prismatic driver."""
+
+
+def _rate_source(env: ManagerBasedRLEnv, name: str):
+    """Object exposing ``joint_ids`` and ``target_rate`` of the prismatics: an action term or the external driver."""
+    return env.prismatic_driver if name == PRISMATIC_DRIVER else env.action_manager.get_term(name)
+
 
 class ElectricalPowerModel:
     """Vectorized per-motor power of the 16 motors; built once per env (joint indices resolved by name)."""
@@ -117,7 +149,7 @@ class ElectricalPowerModel:
         self.labels = [m[0] for m in _MOTORS]
         self.models = [m[1] for m in _MOTORS]
         dev = env.device
-        term = env.action_manager.get_term(action_term_name)
+        term = _rate_source(env, action_term_name)
         # prismatic joints in action-term order -> column of target_rate
         term_cols = {robot.joint_names[j]: c for c, j in enumerate(term.joint_ids)}
         self._direct = [i for i, m in enumerate(_MOTORS) if m[2] == "rev"]
@@ -156,7 +188,7 @@ class ElectricalPowerModel:
         mech_a = tau_a * (wp + self._ankle_sign * wr)
         # leadscrews
         force = tau_all[:, self._screw_j]
-        v = env.action_manager.get_term(self.action_term_name).target_rate[:, self._screw_col]
+        v = _rate_source(env, self.action_term_name).target_rate[:, self._screw_col]
         fv = force * v
         driving = fv > 0.0
         k = LEADSCREW_LEAD / (2.0 * math.pi)

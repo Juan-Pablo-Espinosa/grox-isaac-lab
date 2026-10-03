@@ -10,6 +10,7 @@ Mirror = reflection through the robot's sagittal (x-z) plane, y -> -y:
   * axial (angular) vectors (x, y, z) -> (-x,  y, -z): base_ang_vel, imu_ang_vel
   * velocity command (vx, vy, wz) -> (vx, -vy, -wz)
   * scalar flags (morph_locked) are mirror-invariant
+  * external prismatic driver targets (prismatic_targets, morphology-agnostic task): L <-> R swap, sign +1
   * joints: Left <-> Right swap with a per-pair sign, R = s * L, measured by FK (pose of every right-leg body vs the
     mirrored left-leg body; wrong sign costs 16-1005 mm / 24-183 deg of error):
         Hip_Pitch -1, Hip_Roll -1, Upperleg_Yaw -1, Lowerleg_Pitch -1, Feet_Roll -1,
@@ -87,6 +88,12 @@ def _maps(env) -> dict[str, torch.Tensor]:
             p, s = _joint_map(joint_names)
             obs_perm += [off + i for i in p]
             obs_sign += s
+        elif name == "prismatic_targets":
+            names = list(u.prismatic_driver.joint_names)
+            assert size == len(names), f"prismatic_targets: {size} != {len(names)}"
+            p, s = _joint_map(names)
+            obs_perm += [off + i for i in p]
+            obs_sign += s
         elif name == "actions":
             assert size == len(act_names), f"actions: {size} != {len(act_names)}"
             p, s = _joint_map(act_names)
@@ -107,13 +114,13 @@ def _maps(env) -> dict[str, torch.Tensor]:
 
 
 def mirror_policy_obs(env, obs: torch.Tensor) -> torch.Tensor:
-    """Mirror a (batch, 67) policy observation tensor."""
+    """Mirror a (batch, obs_dim) policy observation tensor."""
     m = _maps(env)
     return obs[:, m["obs_perm"]] * m["obs_sign"]
 
 
 def mirror_actions(env, actions: torch.Tensor) -> torch.Tensor:
-    """Mirror a (batch, 16) action tensor (12 revolute in action-term order, then U_L, U_R, L_L, L_R)."""
+    """Mirror a (batch, action_dim) action tensor (12 revolute in action-term order [, then U_L, U_R, L_L, L_R])."""
     m = _maps(env)
     return actions[:, m["act_perm"]] * m["act_sign"]
 
