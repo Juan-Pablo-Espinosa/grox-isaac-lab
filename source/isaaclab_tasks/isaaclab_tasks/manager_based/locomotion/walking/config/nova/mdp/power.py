@@ -17,9 +17,11 @@ Per motor m:  P_m = max(tau_m * omega_m + P_cu(tau_m), 0)   [W]   (no regenerati
 Motor assignment (sim joint -> motor):
   * Hip_Pitch_*, Lowerleg_Pitch_*: RobStride 04; Hip_Roll_*: RobStride 03; Upperleg_Yaw_*: RobStride 06 -- tau = the
     joint's applied torque, omega = joint velocity.
-  * Ankle: 2x RobStride 02 per side in a parallel linkage. APPROXIMATION (geometry-dependent, linkage ratio taken as
-    1): tau_m1,2 = (tau_pitch +/- tau_roll) / 2, omega_m1,2 = omega_pitch +/- omega_roll (power-consistent:
-    sum tau_m * omega_m = tau_pitch * omega_pitch + tau_roll * omega_roll).
+  * Ankle: 2x RobStride 02 per side in a parallel linkage with ratios (N_p, N_r):
+    tau_m1,2 = (tau_pitch / N_p +/- tau_roll / N_r) / 2, omega_m1,2 = N_p omega_pitch +/- N_r omega_roll
+    (power-consistent: sum tau_m * omega_m = tau_pitch * omega_pitch + tau_roll * omega_roll). The env cfg attribute
+    ``ankle_transmission = (N_p, N_r)`` selects it; without it (walking task, runs 4/5) the "direct" model (1, 1) is
+    used, i.e. tau_m1,2 = (tau_pitch +/- tau_roll) / 2 -- unchanged from run 5.
   * Prismatics: RobStride 00 driving a T12x8 leadscrew (8 mm lead) directly. F = applied joint force [N], screw
     speed v = commanded target rate of the prismatic action term (PhysX reports phantom prismatic joint velocity).
     Driving (F * v > 0): tau_m = |F| * lead / (2 pi eta_drive), mechanical power +|F v| / eta_drive.
@@ -142,7 +144,9 @@ def _rate_source(env: ManagerBasedRLEnv, name: str):
 class ElectricalPowerModel:
     """Vectorized per-motor power of the 16 motors; built once per env (joint indices resolved by name)."""
 
-    def __init__(self, env: ManagerBasedRLEnv, action_term_name: str):
+    def __init__(
+        self, env: ManagerBasedRLEnv, action_term_name: str, ankle_transmission: tuple[float, float] = (1.0, 1.0)
+    ):
         robot = env.scene["robot"]
         names = list(robot.joint_names)
         self.action_term_name = action_term_name
@@ -158,6 +162,7 @@ class ElectricalPowerModel:
         self._ankle_pitch_j = torch.tensor([names.index(_MOTORS[i][3][0]) for i in self._ankle], device=dev)
         self._ankle_roll_j = torch.tensor([names.index(_MOTORS[i][3][1]) for i in self._ankle], device=dev)
         self._ankle_sign = torch.tensor([1.0 if _MOTORS[i][2] == "ankle+" else -1.0 for i in self._ankle], device=dev)
+        self.ankle_transmission = (float(ankle_transmission[0]), float(ankle_transmission[1]))
         self._screw = [i for i, m in enumerate(_MOTORS) if m[2] == "screw"]
         self._screw_j = torch.tensor([names.index(_MOTORS[i][3]) for i in self._screw], device=dev)
         self._screw_col = torch.tensor([term_cols[_MOTORS[i][3]] for i in self._screw], device=dev)
@@ -184,8 +189,9 @@ class ElectricalPowerModel:
         # ankle linkage (approximation, see module docstring)
         tp, tr = tau_all[:, self._ankle_pitch_j], tau_all[:, self._ankle_roll_j]
         wp, wr = qd_all[:, self._ankle_pitch_j], qd_all[:, self._ankle_roll_j]
-        tau_a = 0.5 * (tp + self._ankle_sign * tr)
-        mech_a = tau_a * (wp + self._ankle_sign * wr)
+        n_p, n_r = self.ankle_transmission
+        tau_a = 0.5 * (tp / n_p + self._ankle_sign * tr / n_r)
+        mech_a = tau_a * (n_p * wp + self._ankle_sign * n_r * wr)
         # leadscrews
         force = tau_all[:, self._screw_j]
         v = _rate_source(env, self.action_term_name).target_rate[:, self._screw_col]
@@ -208,7 +214,8 @@ def power_model(env: ManagerBasedRLEnv, action_term_name: str = "prismatic") -> 
     """The env's (cached) :class:`ElectricalPowerModel`."""
     model = getattr(env, "_nova_power_model", None)
     if model is None or model.action_term_name != action_term_name:
-        model = ElectricalPowerModel(env, action_term_name)
+        transmission = getattr(env.cfg, "ankle_transmission", None) or (1.0, 1.0)
+        model = ElectricalPowerModel(env, action_term_name, transmission)
         env._nova_power_model = model
     return model
 
