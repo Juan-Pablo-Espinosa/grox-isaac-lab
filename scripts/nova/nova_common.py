@@ -49,6 +49,13 @@ def checkpoint_obs_dim(path: str) -> int:
     return int(state["mlp.0.weight"].shape[1])
 
 
+def checkpoint_action_dim(path: str) -> int:
+    """Output size of the checkpoint's actor MLP (16 = walking task, 12 = morphology-agnostic task)."""
+    state = torch.load(path, map_location="cpu", weights_only=False)["actor_state_dict"]
+    layers = sorted(int(k.split(".")[1]) for k in state if k.startswith("mlp.") and k.endswith(".weight"))
+    return int(state[f"mlp.{layers[-1]}.weight"].shape[0])
+
+
 def make_env_and_policy(task: str, env_cfg, agent_cfg, resume_path: str):
     """Build the wrapped env and load the deterministic inference policy (mean actions)."""
     env = RslRlVecEnvWrapper(gym.make(task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
