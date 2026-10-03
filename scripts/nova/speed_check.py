@@ -14,7 +14,9 @@ Launch (headless)::
 One simulation, ``--envs`` envs per (forward speed, leg length) cell; the leg length is held (upper = lower = the
 cell's value). After ``--settle`` s, ``--duration`` s are measured on envs that have not fallen. Motor speed:
   * Hip_Pitch, Lowerleg_Pitch (RS04), Hip_Roll (RS03), Upperleg_Yaw (RS06): |joint velocity|
-  * ankle RS02 motors: |omega_pitch +/- omega_roll| (same linkage approximation as the power model)
+  * ankle RS02 motors: |N_p omega_pitch +/- N_r omega_roll| with the env's ``ankle_transmission`` (N_p, N_r)
+    (walking task: (1, 1)); "ankle_pitch" also checks the pitch JOINT speed against the RS02 no-load / N_p
+    (42.94 / 3 = 14.3 rad/s for the morph-agnostic task)
   * leadscrew RS00: 2 pi |target rate| / lead (8 mm)
 Each group's p95 is compared with the module's no-load output speed at 48 V (datasheet), and flagged above 80%.
 """
@@ -64,6 +66,7 @@ GROUPS = {
     "hip_roll": ("RS03", ("Hip_Roll_",)),
     "hip_yaw": ("RS06", ("Upperleg_Yaw_",)),
     "ankle": ("RS02", ()),
+    "ankle_pitch": ("RS02", ()),
     "leadscrew": ("RS00", ()),
 }
 
@@ -98,6 +101,9 @@ def main():
     ids = {g: [i for i, nm in enumerate(names) if nm.startswith(p)] for g, (_, p) in GROUPS.items() if p}
     fp = [names.index(f"Feet_Pitch_{s}_Joint") for s in ("Left", "Right")]
     fr = [names.index(f"Feet_Roll_{s}_Joint") for s in ("Left", "Right")]
+    n_p, n_r = getattr(u.cfg, "ankle_transmission", None) or (1.0, 1.0)
+    group_limit = {g: ROBSTRIDE[m].no_load_speed for g, (m, _) in GROUPS.items()}
+    group_limit["ankle_pitch"] = ROBSTRIDE["RS02"].no_load_speed / n_p
     cmd_vec = torch.zeros(n, 3, device=dev)
     cmd_vec[:, 0] = torch.tensor([v for v, _ in cells for _ in range(args_cli.envs)], device=dev)
     nova_common.route_resample(u, cmd_vec)
@@ -120,8 +126,9 @@ def main():
             mask = alive.unsqueeze(1)
             for g, jid in ids.items():
                 samples[g].append(torch.where(mask, qd[:, jid].abs(), nan))
-            ankle = torch.cat([(qd[:, fp] + qd[:, fr]).abs(), (qd[:, fp] - qd[:, fr]).abs()], dim=1)
+            ankle = torch.cat([(n_p * qd[:, fp] + n_r * qd[:, fr]).abs(), (n_p * qd[:, fp] - n_r * qd[:, fr]).abs()], 1)
             samples["ankle"].append(torch.where(mask, ankle, nan))
+            samples["ankle_pitch"].append(torch.where(mask, qd[:, fp].abs(), nan))
             screw = leg_src.target_rate.abs() * 2.0 * math.pi / LEADSCREW_LEAD
             samples["leadscrew"].append(torch.where(mask, screw, nan))
             vx_sum += alive.float() * robot.data.root_lin_vel_b.torch[:, 0]
@@ -134,6 +141,10 @@ def main():
         + ", ".join(
             f"{m} {ROBSTRIDE[m].no_load_speed_rpm:.0f} rpm = {ROBSTRIDE[m].no_load_speed:.2f} rad/s" for m in ROBSTRIDE
         )
+    )
+    print(
+        f"  ankle transmission (N_p, N_r) = ({n_p:g}, {n_r:g}); ankle_pitch = pitch joint speed vs "
+        f"{group_limit['ankle_pitch']:.2f} rad/s"
     )
     print(
         f"  (leadscrew: RS00 no-load {ROBSTRIDE['RS00'].no_load_speed:.2f} rad/s = "
@@ -154,11 +165,13 @@ def main():
                 if (~torch.isnan(x)).any()
                 else float("nan")
             )
-            frac = p95 / ROBSTRIDE[model].no_load_speed
+            frac = p95 / group_limit[g]
             parts.append(f"{p95:7.2f} ({frac * 100:4.0f}%)" + ("!" if frac > args_cli.flag else " "))
             if frac > args_cli.flag:
                 flagged.append(
-                    f"{g} at vx {v} legs {q * 1000:.0f} mm: p95 {p95:.2f} rad/s = {frac * 100:.0f}% of {model} no-load"
+                    f"{g} at vx {v} legs {q * 1000:.0f} mm: p95 {p95:.2f} rad/s = {frac * 100:.0f}% of "
+                    f"{group_limit[g]:.2f} rad/s ({model} no-load"
+                    f"{' / N_p' if g == 'ankle_pitch' else ''})"
                 )
         print(
             f"  vx {v:.1f} legs {q * 1000:3.0f} mm     {n_alive:3d}/{int(sel.sum()):<3d} {vx:6.2f} | "

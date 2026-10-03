@@ -171,7 +171,9 @@ def main():
         )
         for g in TAU_GROUPS:
             ax_tau.plot(ts, get(rows, "tau_frac_" + g), lw=1.2, label=g)
-        ax_tau.plot(ts, get(rows, "ankle_rs02_frac_max"), "k-", lw=1.2, label="ankle RS02 / 6 N·m (max motor)")
+        ax_tau.plot(ts, get(rows, "ankle_rs02_frac_max"), "k-", lw=1.2, label="ankle RS02 / 6 N·m cont. (max motor)")
+        if "ankle_rs02_peak_frac_max" in col:
+            ax_tau.plot(ts, get(rows, "ankle_rs02_peak_frac_max"), "k:", lw=1.2, label="ankle RS02 / 17 N·m peak")
         ax_tau.axhline(1.0, color="r", lw=0.8, ls=":")
         ax_tau.set_title("|tau| / tau_max per group, ankle RS02 torque / rated", fontsize=9)
         ax_tau.legend(fontsize=7, loc="upper left", ncol=3)

@@ -8,6 +8,13 @@
 Usage (plain Python, no simulator)::
 
     ~/env_isaaclab/bin/python scripts/nova/compare_recordings.py rec_A.csv rec_B.csv [...] [--settle 3] [--out PNG]
+        [--transmission {recorded,direct,linkage} [--n_pitch 3 --n_roll 1]]
+
+--transmission re-derives the four ankle motors from the recorded ankle joint torques / velocities (so recordings made
+with an older model can be re-analysed): direct = the run-5 model tau_1,2 = (tau_p +/- tau_r) / 2, w_1,2 = w_p +/- w_r;
+linkage = tau_1,2 = (tau_p / N_p +/- tau_r / N_r) / 2, w_1,2 = N_p w_p +/- N_r w_r (defaults N_p = 3, N_r = 1).
+Per motor P = max(tau w + 1.5 R (tau / Kt)^2, 0) with the power model's RS02 constants; the ankle group, P_elec totals
+and the ankle RS02 load are replaced accordingly. "recorded" (default) uses the CSV as written.
 
 The first ``--settle`` seconds of every recording are discarded. Per recording:
   * mean actual speed |v_xy| and v_x (base frame) [m/s]; tracking error mean |v_xy - cmd_xy| [m/s]
@@ -16,20 +23,82 @@ The first ``--settle`` seconds of every recording are discarded. Per recording:
   * mean and p95 of |tau| / tau_max per joint group (hip_knee, roll, yaw, ankle)
   * ankle RS02 torque / 6 N·m rated (max motor per step): mean and p95 [%]
   * step frequency (touchdowns of both feet per second) [Hz] and stride length (distance per two steps) [m]
-  * mean q_U, q_L [mm]; falls (reset jumps) in the window
+  * ankle group mean P and copper P [W]; mean q_U, q_L [mm]; falls (reset jumps) in the window
 Prints a table (one column per recording) and saves overlay plots (default next to the first CSV).
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import re
+import sys
 
 import numpy as np
 import pandas as pd
 
 GROUPS = ("hip_knee", "roll", "yaw", "ankle")
+_POWER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "source",
+    "isaaclab_tasks",
+    "isaaclab_tasks",
+    "manager_based",
+    "locomotion",
+    "walking",
+    "config",
+    "nova",
+    "mdp",
+    "power.py",
+)
+
+
+def _power_module():
+    """The task's power model module (torch-only at import), loaded by path so no Isaac Lab import is needed."""
+    spec = importlib.util.spec_from_file_location("nova_power_model", _POWER)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def retransmit(df: pd.DataFrame, n_p: float, n_r: float) -> pd.DataFrame:
+    """Recompute the ankle motors (and every total that includes them) with transmission ratios (n_p, n_r)."""
+    pm = _power_module()
+    rs02 = pm.ROBSTRIDE["RS02"]
+    k_cu = 1.5 * rs02.r_terminal / rs02.kt**2
+    df = df.copy()
+    new_p = new_cu = new_mech = 0.0
+    fracs = []
+    for side in ("Left", "Right"):
+        tp, tr = df[f"tau_Feet_Pitch_{side}_Joint"], df[f"tau_Feet_Roll_{side}_Joint"]
+        wp, wr = df[f"qd_Feet_Pitch_{side}_Joint"], df[f"qd_Feet_Roll_{side}_Joint"]
+        for m, sgn in (("m1", 1.0), ("m2", -1.0)):
+            tau = 0.5 * (tp / n_p + sgn * tr / n_r)
+            w = n_p * wp + sgn * n_r * wr
+            cu = k_cu * tau**2
+            p = np.maximum(tau * w + cu, 0.0)
+            label = f"ankle_{side}_{m}"
+            df[f"p_{label}"] = p
+            df[f"ankle_rs02_frac_{label}"] = tau.abs() / rs02.rated_torque
+            fracs.append(tau.abs())
+            new_p, new_cu, new_mech = new_p + p, new_cu + cu, new_mech + (p - cu)
+    for total, group, new in (
+        ("p_elec", "p_ankle", new_p),
+        ("p_copper", "cu_ankle", new_cu),
+        ("p_mech", "mech_ankle", new_mech),
+    ):
+        df[total] = df[total] - df[group] + new
+        df[group] = new
+    peak = pd.concat(fracs, axis=1).max(axis=1)
+    df["ankle_rs02_frac_max"] = peak / rs02.rated_torque
+    if "ankle_rs02_peak_frac_max" in df:
+        df["ankle_rs02_peak_frac_max"] = peak / rs02.peak_torque
+    df["ankle_n_pitch"], df["ankle_n_roll"] = n_p, n_r
+    return df
 
 
 def label_of(path: str) -> str:
@@ -38,8 +107,10 @@ def label_of(path: str) -> str:
     return m.group(1) if m else os.path.basename(path)
 
 
-def analyze(path: str, settle: float) -> tuple[dict, pd.DataFrame]:
+def analyze(path: str, settle: float, transmission: tuple[float, float] | None = None) -> tuple[dict, pd.DataFrame]:
     df = pd.read_csv(path)
+    if transmission is not None:
+        df = retransmit(df, *transmission)
     dt = float(np.median(np.diff(df["t"].to_numpy())))
     w = df[df["t"] >= df["t"].iloc[0] + settle].reset_index(drop=True)
     if len(w) < 2:
@@ -77,6 +148,11 @@ def analyze(path: str, settle: float) -> tuple[dict, pd.DataFrame]:
     a = w["ankle_rs02_frac_max"].to_numpy() * 100.0
     r["ankle_rs02_pct_rated_mean"] = float(a.mean())
     r["ankle_rs02_pct_rated_p95"] = float(np.percentile(a, 95))
+    r["p_ankle_mean_W"] = float(w["p_ankle"].mean())
+    r["cu_ankle_mean_W"] = float(w["cu_ankle"].mean())
+    r["transmission"] = (
+        f"{w['ankle_n_pitch'].iloc[0]:g}/{w['ankle_n_roll'].iloc[0]:g}" if "ankle_n_pitch" in w else "1/1 (old CSV)"
+    )
     r["step_freq_hz"] = touch / duration
     r["stride_length_m"] = dist / (touch / 2.0) if touch >= 2 else float("nan")
     r["q_U_mm"] = float(w["q_U"].mean())
@@ -141,12 +217,19 @@ def main():
     p.add_argument("csv", nargs="+")
     p.add_argument("--settle", type=float, default=3.0, help="Seconds discarded at the start of each recording.")
     p.add_argument("--out", type=str, default=None, help="Overlay plot PNG (default: next to the first CSV).")
+    p.add_argument("--transmission", choices=["recorded", "direct", "linkage"], default="recorded")
+    p.add_argument("--n_pitch", type=float, default=3.0, help="linkage: ankle pitch ratio N_p.")
+    p.add_argument("--n_roll", type=float, default=1.0, help="linkage: ankle roll ratio N_r.")
     a = p.parse_args()
     labels = [label_of(c) for c in a.csv]
-    results, frames = zip(*(analyze(c, a.settle) for c in a.csv))
+    tr = {"recorded": None, "direct": (1.0, 1.0), "linkage": (a.n_pitch, a.n_roll)}[a.transmission]
+    results, frames = zip(*(analyze(c, a.settle, tr) for c in a.csv))
     table = pd.DataFrame(list(results), index=labels).T
     with pd.option_context("display.float_format", "{:.3f}".format, "display.width", 200, "display.max_columns", 20):
-        print(f"\n=== {len(a.csv)} recordings, first {a.settle:.1f} s discarded")
+        print(
+            f"\n=== {len(a.csv)} recordings, first {a.settle:.1f} s discarded, ankle transmission: {a.transmission}"
+            + (f" (N_p {tr[0]:g}, N_r {tr[1]:g})" if tr else "")
+        )
         print(table.to_string())
     out = a.out or os.path.join(
         os.path.dirname(os.path.abspath(a.csv[0])), "compare_" + "_vs_".join(labels)[:120] + ".png"

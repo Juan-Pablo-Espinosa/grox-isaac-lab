@@ -11,8 +11,11 @@ One row per control step, built on the GPU (no host sync unless a consumer pulls
   p_<group>, mech_<group>, cu_<group> for hip_knee, roll, yaw, ankle, leadscrew [W];
   tau_frac_<group> = mean |tau| / effort limit over the joints of hip_knee, roll, yaw, ankle;
   ankle_rs02_frac_max and ankle_rs02_frac_<motor> = |ankle motor torque| / 6 N·m (RS02 rated);
+  ankle_rs02_peak_frac_max = max ankle motor |torque| / 17 N·m (RS02 peak);
   q_U, q_L (L/R mean joint position), q_U_target, q_L_target, q_U_goal, q_L_goal [mm];
-  contact_L, contact_R (0/1); mass [kg]; tau_<joint> [N·m or N], qd_<joint> [rad/s or m/s], p_<motor> [W].
+  contact_L, contact_R (0/1); mass [kg]; ankle_n_pitch, ankle_n_roll (transmission used by the power model);
+  tau_<joint> [N·m or N], qd_<joint> [rad/s or m/s], p_<motor> [W];
+  taum_<motor> = |motor output torque| [N·m], pct_cont_<motor> / pct_peak_<motor> = taum / rated / peak torque [%].
 The recorder adds t [s], energy_J (cumulative) and cot_running (energy / (m g path length)) when it writes the CSV.
 """
 
@@ -25,6 +28,7 @@ import numpy as np
 import torch
 
 from isaaclab_tasks.manager_based.locomotion.walking.config.nova.mdp.power import (
+    _MOTORS,
     DASHBOARD_GROUPS,
     ROBSTRIDE,
     dashboard_group,
@@ -72,19 +76,29 @@ class SignalExtractor:
         ]
         self.pris_ids = [jn.index(n) for n in prismatic_joints]
         self.mass = robot.data.body_mass.torch.sum(dim=1).to(dev)
+        self.transmission = torch.tensor(model.ankle_transmission, device=dev)
+        specs = [ROBSTRIDE[m[1]] for m in _MOTORS]
+        self.inv_rated = torch.tensor([100.0 / sp.rated_torque for sp in specs], device=dev)
+        self.inv_peak = torch.tensor([100.0 / sp.peak_torque for sp in specs], device=dev)
         self.names = (
             ["cmd_vx", "cmd_vy", "cmd_wz", "vx", "vy", "wz", "pos_x", "pos_y", "p_elec", "p_mech", "p_copper"]
             + [f"{k}_{g}" for g in DASHBOARD_GROUPS for k in ("p", "mech", "cu")]
             + [f"tau_frac_{g}" for g in TORQUE_GROUPS]
             + ["ankle_rs02_frac_max"]
             + [f"ankle_rs02_frac_{self.labels[i]}" for i in self.ankle_motor_ids]
+            + ["ankle_rs02_peak_frac_max"]
             + ["q_U", "q_L", "q_U_target", "q_L_target", "q_U_goal", "q_L_goal", "contact_L", "contact_R", "mass"]
+            + ["ankle_n_pitch", "ankle_n_roll"]
             + [f"tau_{n}" for n in jn]
             + [f"qd_{n}" for n in jn]
             + [f"p_{lab}" for lab in self.labels]
+            + [f"taum_{lab}" for lab in self.labels]
+            + [f"pct_cont_{lab}" for lab in self.labels]
+            + [f"pct_peak_{lab}" for lab in self.labels]
         )
         # per-joint / per-motor columns are recorded but not sent to the dashboard
         detail = {f"tau_{n}" for n in jn} | {f"qd_{n}" for n in jn} | {f"p_{lab}" for lab in self.labels}
+        detail |= {f"{k}_{lab}" for lab in self.labels for k in ("taum", "pct_cont", "pct_peak")}
         self.dashboard_idx = [i for i, n in enumerate(self.names) if n not in detail]
 
     def row(self, env_id: int = 0) -> torch.Tensor:
@@ -117,12 +131,17 @@ class SignalExtractor:
                 frac,
                 ankle.max().unsqueeze(0),
                 ankle,
+                (tau_m[self.ankle_motor_ids].max() / ROBSTRIDE["RS02"].peak_torque).unsqueeze(0),
                 legs,
                 contact,
                 self.mass[e : e + 1],
+                self.transmission,
                 tau,
                 qd,
                 p,
+                tau_m,
+                tau_m * self.inv_rated,
+                tau_m * self.inv_peak,
             ]
         )
 
