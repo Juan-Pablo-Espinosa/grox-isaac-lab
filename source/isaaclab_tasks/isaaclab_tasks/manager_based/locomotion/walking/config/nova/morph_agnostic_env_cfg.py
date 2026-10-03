@@ -44,7 +44,7 @@ from .mdp.hardware import (
     TorqueSpeedPDActuatorCfg,
     tn_curve,
 )
-from .mdp.power import ROBSTRIDE
+from .mdp.power import DATASHEET_RESISTANCE, ROBSTRIDE
 from .mdp.prismatic_driver import PrismaticDriverCfg
 from .walking_env_cfg import (
     NOVA_PRISMATIC_JOINTS,
@@ -58,6 +58,13 @@ from .walking_env_cfg import (
 # roll 20 < 20.42 (RS03), yaw 20 (RS06 no-load 50.27), ankle pitch 42.94 / N_p, ankle roll min(42.94 / N_r, 15) rad/s.
 ANKLE_PITCH_VELOCITY_LIMIT = ROBSTRIDE["RS02"].no_load_speed / ANKLE_N_PITCH
 ANKLE_ROLL_VELOCITY_LIMIT = min(ROBSTRIDE["RS02"].no_load_speed / ANKLE_N_ROLL, 15.0)
+
+
+# Ankle damping for a damping ratio of 0.7 at kp 150 with the linkage armature: kd = 2 * 0.7 * sqrt(kp * I) with
+# I = 1 / ((M + A)^-1)_jj from the PhysX joint-space mass matrix + armature (pitch 0.0787, roll 0.00921 kg m^2; the same
+# within 0.1% in stance / swing and for short / mid / long legs). The walking gains (1.42 / 0.72, damping ratio 1
+# without armature) gave 0.21 / 0.31 here.
+NOVA_ANKLE_DAMPING = {"Feet_Roll_.*": 1.645, "Feet_Pitch_.*": 4.81}
 
 
 def _armature(*patterns: str) -> dict[str, float]:
@@ -94,7 +101,7 @@ def nova_hardware_actuators() -> dict:
         "feet": AnkleLinkagePDActuatorCfg(
             joint_names_expr=["Feet_Roll_.*", "Feet_Pitch_.*"],
             stiffness=g["feet"][0],
-            damping=g["feet"][1],
+            damping=dict(NOVA_ANKLE_DAMPING),
             effort_limit=ankle_limits,
             effort_limit_sim=ankle_limits,
             velocity_limit={"Feet_Pitch_.*": ANKLE_PITCH_VELOCITY_LIMIT, "Feet_Roll_.*": ANKLE_ROLL_VELOCITY_LIMIT},
@@ -137,6 +144,8 @@ class NovaMorphAgnosticEnvCfg(NovaWalkingEnvCfg):
     observations: MorphAgnosticObservationsCfg = MorphAgnosticObservationsCfg()
     ankle_transmission: tuple[float, float] = (ANKLE_N_PITCH, ANKLE_N_ROLL)
     """Ankle linkage ratios (N_p, N_r) used by the electrical power metric (mdp/power.py)."""
+    motor_resistance: dict[str, float] = dict(DATASHEET_RESISTANCE)
+    """Datasheet terminal resistances for the electrical power metric (overrides the run-5 constants)."""
     prismatic_driver: PrismaticDriverCfg = PrismaticDriverCfg(
         joint_names=NOVA_PRISMATIC_JOINTS,
         max_velocity=NOVA_PRISMATIC_MAX_SPEED,

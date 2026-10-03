@@ -81,6 +81,10 @@ ROBSTRIDE = {
     "RS04": MotorSpec(2.1, 0.16, 40.0, 120.0, rated_speed_rpm=167.0, no_load_speed_rpm=200.0),
     "RS06": MotorSpec(1.09, 0.22, 11.0, 36.0, rated_speed_rpm=100.0, no_load_speed_rpm=480.0),  # R estimate
 }
+DATASHEET_RESISTANCE = {"RS00": 1.5, "RS02": 0.55, "RS06": 0.23}
+"""Terminal resistances [Ohm] from the RobStride 2026-09-17 spec sheet where they differ from :data:`ROBSTRIDE` (whose
+RS00 / RS06 values were estimates, RS02 an older listing). Used by the morph-agnostic task's metrics (env cfg
+``motor_resistance``); :data:`ROBSTRIDE` stays as run 5 used it."""
 LEADSCREW_LEAD = 0.008
 """T12x8 lead [m/rev]."""
 LEADSCREW_ETA_DRIVE = 0.58
@@ -145,7 +149,11 @@ class ElectricalPowerModel:
     """Vectorized per-motor power of the 16 motors; built once per env (joint indices resolved by name)."""
 
     def __init__(
-        self, env: ManagerBasedRLEnv, action_term_name: str, ankle_transmission: tuple[float, float] = (1.0, 1.0)
+        self,
+        env: ManagerBasedRLEnv,
+        action_term_name: str,
+        ankle_transmission: tuple[float, float] = (1.0, 1.0),
+        resistance: dict[str, float] | None = None,
     ):
         robot = env.scene["robot"]
         names = list(robot.joint_names)
@@ -167,7 +175,9 @@ class ElectricalPowerModel:
         self._screw_j = torch.tensor([names.index(_MOTORS[i][3]) for i in self._screw], device=dev)
         self._screw_col = torch.tensor([term_cols[_MOTORS[i][3]] for i in self._screw], device=dev)
         # per-motor copper coefficient 1.5 * R / Kt^2 [W / (N·m)^2], in motor order
-        self._cu = torch.tensor([1.5 * ROBSTRIDE[m].r_terminal / ROBSTRIDE[m].kt ** 2 for m in self.models], device=dev)
+        r = {m: (resistance or {}).get(m, spec.r_terminal) for m, spec in ROBSTRIDE.items()}
+        self.resistance = r
+        self._cu = torch.tensor([1.5 * r[m] / ROBSTRIDE[m].kt ** 2 for m in self.models], device=dev)
         self._order = torch.tensor(self._direct + self._ankle + self._screw, device=dev)
         self._inv = torch.argsort(self._order)
         self._cache_step = -1
@@ -215,7 +225,7 @@ def power_model(env: ManagerBasedRLEnv, action_term_name: str = "prismatic") -> 
     model = getattr(env, "_nova_power_model", None)
     if model is None or model.action_term_name != action_term_name:
         transmission = getattr(env.cfg, "ankle_transmission", None) or (1.0, 1.0)
-        model = ElectricalPowerModel(env, action_term_name, transmission)
+        model = ElectricalPowerModel(env, action_term_name, transmission, getattr(env.cfg, "motor_resistance", None))
         env._nova_power_model = model
     return model
 

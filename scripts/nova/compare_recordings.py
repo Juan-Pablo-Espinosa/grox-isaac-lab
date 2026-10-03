@@ -13,7 +13,8 @@ Usage (plain Python, no simulator)::
 --transmission re-derives the four ankle motors from the recorded ankle joint torques / velocities (so recordings made
 with an older model can be re-analysed): direct = the run-5 model tau_1,2 = (tau_p +/- tau_r) / 2, w_1,2 = w_p +/- w_r;
 linkage = tau_1,2 = (tau_p / N_p +/- tau_r / N_r) / 2, w_1,2 = N_p w_p +/- N_r w_r (defaults N_p = 3, N_r = 1).
-Per motor P = max(tau w + 1.5 R (tau / Kt)^2, 0) with the power model's RS02 constants; the ankle group, P_elec totals
+Per motor P = max(tau w + 1.5 R (tau / Kt)^2, 0) with RS02 R = 0.58 (direct) / 0.55 (linkage, datasheet); the ankle
+group, P_elec totals
 and the ankle RS02 load are replaced accordingly. "recorded" (default) uses the CSV as written.
 
 The first ``--settle`` seconds of every recording are discarded. Per recording:
@@ -69,7 +70,9 @@ def retransmit(df: pd.DataFrame, n_p: float, n_r: float) -> pd.DataFrame:
     """Recompute the ankle motors (and every total that includes them) with transmission ratios (n_p, n_r)."""
     pm = _power_module()
     rs02 = pm.ROBSTRIDE["RS02"]
-    k_cu = 1.5 * rs02.r_terminal / rs02.kt**2
+    # linkage = the morph-agnostic model (datasheet RS02 resistance); direct = the run-5 model and constants
+    r = pm.DATASHEET_RESISTANCE["RS02"] if (n_p, n_r) != (1.0, 1.0) else rs02.r_terminal
+    k_cu = 1.5 * r / rs02.kt**2
     df = df.copy()
     new_p = new_cu = new_mech = 0.0
     fracs = []
