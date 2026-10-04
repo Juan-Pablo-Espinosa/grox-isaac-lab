@@ -12,8 +12,9 @@ queue is full). Messages: a header {"names": [...], "dt": s, "window": s}, then 
 {"cmd": "save", "path": png}. Without a display the window is not shown, but "save" still renders a PNG.
 
 Panels (rolling window, default 20 s): commanded vs actual vx / vy / wz; P_elec stacked by motor group with total
-mechanical vs copper; cumulative energy [J] and running CoT; |tau| / tau_max per joint group and ankle RS02 torque /
-rated; prismatic q_U, q_L, targets and goals [mm]; foot contact timeline.
+mechanical vs copper; cumulative energy [J] and running CoT; mean |tau| / joint limit per joint group, and the ankle
+MOTOR torque (RS02 output through the linkage) / 6 N·m continuous as the max and the mean of the 4 motors (both feet)
+and the max / 17 N·m peak (fractions, 1.0 = limit); prismatic q_U, q_L, targets and goals [mm]; foot contact timeline.
 """
 
 from __future__ import annotations
@@ -170,12 +171,22 @@ def main():
             fontsize=9,
         )
         for g in TAU_GROUPS:
-            ax_tau.plot(ts, get(rows, "tau_frac_" + g), lw=1.2, label=g)
-        ax_tau.plot(ts, get(rows, "ankle_rs02_frac_max"), "k-", lw=1.2, label="ankle RS02 / 6 N·m cont. (max motor)")
+            ax_tau.plot(ts, get(rows, "tau_frac_" + g), lw=1.2, label=f"{g} joints: mean |tau| / joint limit")
+        # ankle MOTOR torque (RS02 output, through the linkage) as a fraction of the 6 N·m continuous rating
+        ax_tau.plot(
+            ts, get(rows, "ankle_rs02_frac_max"), "k-", lw=1.2, label="ankle motor / 6 N·m: MAX of 4 (both feet)"
+        )
+        motor_cols = [n for n in col if n.startswith("ankle_rs02_frac_ankle_")]
+        if motor_cols:
+            mean4 = [sum(r[col[n]] for n in motor_cols) / len(motor_cols) for r in rows]
+            ax_tau.plot(ts, mean4, "k--", lw=1.0, label="ankle motor / 6 N·m: mean of 4")
         if "ankle_rs02_peak_frac_max" in col:
-            ax_tau.plot(ts, get(rows, "ankle_rs02_peak_frac_max"), "k:", lw=1.2, label="ankle RS02 / 17 N·m peak")
+            ax_tau.plot(
+                ts, get(rows, "ankle_rs02_peak_frac_max"), "k:", lw=1.2, label="ankle motor / 17 N·m peak: MAX of 4"
+            )
         ax_tau.axhline(1.0, color="r", lw=0.8, ls=":")
-        ax_tau.set_title("|tau| / tau_max per group, ankle RS02 torque / rated", fontsize=9)
+        ax_tau.set_ylabel("fraction (1.0 = limit)", fontsize=8)
+        ax_tau.set_title("torque fractions (ankle joint limits 36 pitch / 12 roll N·m; motor cap 6 N·m)", fontsize=9)
         ax_tau.legend(fontsize=7, loc="upper left", ncol=3)
         for name, c in (("q_U", "C0"), ("q_L", "C1")):
             ax_q.plot(ts, get(rows, name), color=c, lw=1.6, label=name)
