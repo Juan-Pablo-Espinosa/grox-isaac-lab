@@ -60,3 +60,10 @@ class NovaMorphAgnosticPPORunnerCfg(NovaWalkingPPORunnerCfg):
     experiment_name = "nova_morph_agnostic"
     # run 4's entropy (the walking task moved to 0.002 for run 5); everything else identical, incl. symmetry
     algorithm = NovaWalkingPPORunnerCfg().algorithm.replace(entropy_coef=0.0025)
+
+
+@configclass
+class NovaMorphAgnosticSquatPPORunnerCfg(NovaMorphAgnosticPPORunnerCfg):
+    """Squat variant: identical PPO settings, own experiment folder."""
+
+    experiment_name = "nova_morph_squat"
