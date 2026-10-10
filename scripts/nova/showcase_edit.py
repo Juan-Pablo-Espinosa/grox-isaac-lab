@@ -9,6 +9,7 @@ Plain Python (PIL + numpy) piping raw RGB frames into ffmpeg; no Isaac Sim neede
 
     python scripts/nova/showcase_edit.py --root ~/nova_showcase --preview 800:1300   # -> preview.mp4
     python scripts/nova/showcase_edit.py --root ~/nova_showcase                       # -> showcase_1080p.mp4
+    python scripts/nova/showcase_edit.py --hero_dir hero_v2 --out showcase_1080p_v2.mp4
 
 Expected layout under --root: data/{hero,lineup}.npz, frames/{hero,lineup}/#####.png (+ screen.json).
 Full edit: title card 3 s + hero (HUD lower third) + lineup (label under each robot) + end card 3 s, with a
@@ -73,24 +74,60 @@ def corner_tag(img: Image.Image):
     d.text((x, y), TAG, font=F_TAG, fill=(70, 72, 78, 255))
 
 
-def command_text(c: np.ndarray) -> tuple[str, str]:
-    """(command string, which measured quantity to show: 'speed' | 'yaw')."""
-    vx, vy, wz = (float(v) for v in c)
-    if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(wz) < 0.03:
-        return "stand", "speed"
-    if abs(wz) >= 0.03 and abs(vx) < 0.05 and abs(vy) < 0.05:
-        return f"turn {abs(wz):.2f} rad/s {'left' if wz > 0 else 'right'}", "yaw"
-    if abs(vy) > abs(vx):
-        return f"{abs(vy):.2f} m/s sideways ({'left' if vy > 0 else 'right'})", "speed"
-    return f"{abs(vx):.2f} m/s {'forward' if vx > 0 else 'backward'}", "speed"
+CMD_ZERO = 0.05
+"""Commands with |value| below this [m/s or rad/s] are shown as 0."""
+SHORT_GAP_S = 0.5
+"""An all-zero command gap shorter than this keeps the surrounding mode label (e.g. a turn reversing through 0)."""
 
 
-def hero_hud(img: Image.Image, cmd: np.ndarray, speed: float, yaw: float, up_mm: float, lo_mm: float):
+def command_mode(c: np.ndarray) -> str | None:
+    """'turn' | 'sideways' | 'forward' (incl. backward), or None when every component is (shown as) 0."""
+    vx, vy, wz = (0.0 if abs(float(v)) < CMD_ZERO else float(v) for v in c)
+    if vx == 0.0 and vy == 0.0 and wz == 0.0:
+        return None
+    if wz != 0.0 and vx == 0.0 and vy == 0.0:
+        return "turn"
+    return "sideways" if abs(vy) > abs(vx) else "forward"
+
+
+def command_labels(cmd: np.ndarray) -> list[tuple[str, str]]:
+    """Per frame (command string, measured quantity 'speed' | 'yaw'). |values| < CMD_ZERO show as 0; all-zero frames
+    read "standing", except short gaps between moving segments, which keep the mode with a 0 value."""
+    modes = [command_mode(c) for c in cmd]
+    k, n, gap = 0, len(modes), int(SHORT_GAP_S * FPS)
+    while k < n:  # fill short all-zero gaps with the previous mode
+        if modes[k] is None:
+            j = k
+            while j < n and modes[j] is None:
+                j += 1
+            if k > 0 and j < n and j - k < gap:
+                modes[k:j] = [modes[k - 1]] * (j - k)
+            k = j
+        else:
+            k += 1
+    out = []
+    for c, mode in zip(cmd, modes):
+        vx, vy, wz = (0.0 if abs(float(v)) < CMD_ZERO else float(v) for v in c)
+        if mode is None:
+            out.append(("standing", "speed"))
+        elif mode == "turn":
+            side = "" if wz == 0.0 else (" left" if wz > 0 else " right")
+            out.append((f"turn {abs(wz):.2f} rad/s{side}", "yaw"))
+        elif mode == "sideways":
+            side = "" if vy == 0.0 else (" (left)" if vy > 0 else " (right)")
+            out.append((f"{abs(vy):.2f} m/s sideways{side}", "speed"))
+        else:
+            side = "" if vx == 0.0 else (" forward" if vx > 0 else " backward")
+            out.append((f"{abs(vx):.2f} m/s{side}", "speed"))
+    return out
+
+
+def hero_hud(img: Image.Image, cmd_label: tuple[str, str], speed: float, yaw: float, up_mm: float, lo_mm: float):
     d = ImageDraw.Draw(img, "RGBA")
     x0, y0, w, h = 60, H - 60 - 206, 640, 206
     d.rounded_rectangle((x0, y0, x0 + w, y0 + h), radius=14, fill=(18, 20, 24, 165))
     d.rectangle((x0, y0 + 14, x0 + 5, y0 + h - 14), fill=CRIMSON + (255,))
-    text, measured = command_text(cmd)
+    text, measured = cmd_label
     rows = [
         ("Command", text),
         (
@@ -169,18 +206,18 @@ def fade_white(img: Image.Image, k: int, n: int, fade: int = 20) -> Image.Image:
 # --------------------------------------------------------------------------------------------- clips
 
 
-def hero_clip(root: str, first: int, last: int, fades: bool = True):
+def hero_clip(root: str, first: int, last: int, fades: bool = True, hero_dir: str = "hero"):
     data = np.load(os.path.join(root, "data", "hero.npz"))
     v = np.linalg.norm(data["root_lin_vel_b"][:, 0, :2], axis=1)
     speed = moving_average(v, 25)
     yaw = moving_average(np.abs(data["root_ang_vel_b"][:, 0, 2]), 25)
     q = data["prism_pos"][:, 0] * 1e3
     up, lo = q[:, 0:2].mean(axis=1), q[:, 2:4].mean(axis=1)
-    cmd = data["command"][:, 0]
+    labels = command_labels(data["command"][:, 0])
     n = last - first + 1
     for k, f in enumerate(range(first, last + 1)):
-        img = Image.open(os.path.join(root, "frames", "hero", f"{f:05d}.png")).convert("RGB")
-        hero_hud(img, cmd[f], speed[f], yaw[f], up[f], lo[f])
+        img = Image.open(os.path.join(root, "frames", hero_dir, f"{f:05d}.png")).convert("RGB")
+        hero_hud(img, labels[f], speed[f], yaw[f], up[f], lo[f])
         corner_tag(img)
         yield fade_white(img, k, n) if fades else img
 
@@ -250,20 +287,23 @@ def main():
     p = argparse.ArgumentParser(description="HUD + edit of the NOVA showcase.")
     p.add_argument("--root", default=os.path.expanduser("~/nova_showcase"))
     p.add_argument("--preview", default=None, help="first:last hero frames -> preview.mp4 (no cards)")
+    p.add_argument("--hero_dir", default="hero", help="hero frame folder under <root>/frames")
+    p.add_argument("--out", default="showcase_1080p.mp4", help="output file name under <root> (full edit)")
     args = p.parse_args()
     root = os.path.expanduser(args.root)
     t0 = time.time()
     if args.preview:
         first, last = (int(v) for v in args.preview.split(":"))
         out = os.path.join(root, "preview.mp4")
-        n = encode(hero_clip(root, first, last), out)
+        n = encode(hero_clip(root, first, last, hero_dir=args.hero_dir), out)
     else:
-        hero_frames = sorted(int(f[:5]) for f in os.listdir(os.path.join(root, "frames", "hero")) if f.endswith(".png"))
-        out = os.path.join(root, "showcase_1080p.mp4")
+        hero_root = os.path.join(root, "frames", args.hero_dir)
+        hero_frames = sorted(int(f[:5]) for f in os.listdir(hero_root) if f.endswith(".png"))
+        out = os.path.join(root, args.out)
 
         def all_frames():
             yield from card_clip(end=False)
-            yield from hero_clip(root, hero_frames[0], hero_frames[-1])
+            yield from hero_clip(root, hero_frames[0], hero_frames[-1], hero_dir=args.hero_dir)
             yield from lineup_clip(root)
             yield from card_clip(end=True)
 

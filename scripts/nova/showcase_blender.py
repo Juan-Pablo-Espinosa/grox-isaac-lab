@@ -38,6 +38,12 @@ URDF = os.path.expanduser("~/Downloads/NOVA_LOWERBODY_V2.1/urdf/NOVA_LOWERBODY_V
 MAX_FACES = 200_000
 TARGET_FACES = 150_000
 FPS = 50
+HERO_DIST = 3.55
+"""Hero camera distance [m]: 50 mm lens (vertical FOV covers 0.405 * d) -> a ~1.0 m robot fills ~70% of the frame."""
+HERO_LOOK_Z = 0.50
+"""Fixed hero look-at height [m] (robot spans ~0 .. 1.0 m)."""
+HIP_SHORT, HIP_LONG = 0.80, 0.98
+"""Standing hip height [m] at (5, 5) and (95, 95) mm (measured in the lineup recording: 0.802 / 0.980)."""
 
 # material per link (prefix match): structure aluminium, motor blocks dark anodized, telescoping segments crimson
 LINK_MATERIAL = {
@@ -72,6 +78,13 @@ def parse_args():
     p.add_argument("--samples", type=int, default=32)
     p.add_argument("--percent", type=int, default=100, help="resolution percentage (quick tests)")
     p.add_argument("--blend", default=None, help="also save the scene as .blend")
+    p.add_argument(
+        "--height_ref",
+        choices=("ruler", "lines", "none"),
+        default="lines",
+        help="hero height reference: vertical hip-height scale beside the robot, or lines at the shortest / longest"
+        " hip heights behind it",
+    )
     return p.parse_args(argv)
 
 
@@ -349,14 +362,16 @@ def camera_path(mode: str, data, frames: np.ndarray, dt: float):
     t = frames * dt
     root = data["body_pos"][:, :, 0]  # (T, R, 3)
     if mode == "hero":
+        # horizontal follow only: camera and look-at heights are fixed (not tied to the hip), so the robot visibly
+        # grows / shrinks on screen. HERO_DIST frames the (95, 95) mm robot (~1.0 m tall) at ~70% of frame height.
         p = smooth_zero_phase(root[:, 0, :2].astype(np.float64), dt, 0.45)[frames]
-        hip = smooth_zero_phase(root[:, 0, 2:3].astype(np.float64), dt, 0.6)[frames, 0]
         az = np.radians(keys_smooth([(0, -38), (21.5, -38), (28.0, 28), (34.0, 28), (38.5, -38), (60, -38)], t))
-        dist = keys_smooth([(0, 4.2), (3.5, 3.3), (40.5, 3.3), (46.0, 6.0), (51.0, 6.0), (55.5, 3.3), (60, 3.3)], t)
+        d0 = HERO_DIST
+        dist = keys_smooth([(0, 4.4), (3.5, d0), (40.5, d0), (46.0, 6.0), (51.0, 6.0), (55.5, d0), (60, d0)], t)
         height = keys_smooth([(0, 0.85), (40.5, 0.85), (46.0, 1.5), (51.0, 1.5), (55.5, 0.85), (60, 0.85)], t)
-        target = np.column_stack([p, 0.62 * hip])
-        cam = target + np.column_stack([dist * np.cos(az), dist * np.sin(az), height - 0.62 * hip])
-        return cam, target, np.column_stack([p, np.zeros(len(p))])
+        target = np.column_stack([p, np.full(len(p), HERO_LOOK_Z)])
+        cam = np.column_stack([p[:, 0] + dist * np.cos(az), p[:, 1] + dist * np.sin(az), height])
+        return cam, target, np.column_stack([p, np.zeros(len(p))]), az
     # lineup: static wide front-3/4, then a slow dolly along the line (y) while following the group forward
     gx = smooth_zero_phase(root[:, :, 0].mean(axis=1, keepdims=True).astype(np.float64), dt, 0.8)[frames, 0]
     ys = root[0, :, 1]
@@ -371,7 +386,76 @@ def camera_path(mode: str, data, frames: np.ndarray, dt: float):
     tgt_y = smooth_zero_phase(tgt_y[:, None], dt, 0.8)[:, 0]
     target = np.column_stack([gx_eff + 0.3, tgt_y, np.full_like(t, 0.45)])
     cam = np.column_stack([cam_x, cam_y, cam_z])
-    return cam, target, np.column_stack([gx_eff, np.zeros_like(t), np.zeros_like(t)])
+    return cam, target, np.column_stack([gx_eff, np.zeros_like(t), np.zeros_like(t)]), None
+
+
+def build_height_ref(kind: str, track: np.ndarray, az: np.ndarray, frames: np.ndarray):
+    """Faint height reference on a rig that follows the robot (horizontally) and faces the camera.
+
+    ``ruler``: vertical scale at the robot's depth, beside it on the camera's left (ticks every 5 cm from 0.70 to
+    1.05 m, labels at 0.8 / 0.9 / 1.0 m "hip height"). ``lines``: horizontal lines just behind the robot at the
+    standing hip height of the shortest and longest configurations. Geometry is in true world heights (rig at z = 0),
+    emissive (unaffected by the lights), casts no shadows, and is occluded by the robot.
+    """
+    rig = bpy.data.objects.new("height_ref", None)
+    bpy.context.scene.collection.objects.link(rig)
+    mat = bpy.data.materials.new("HeightRef")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    em = nt.nodes.new("ShaderNodeEmission")
+    em.inputs["Color"].default_value = (0.42, 0.43, 0.45, 1.0)
+    em.inputs["Strength"].default_value = 1.0
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(em.outputs[0], out.inputs[0])
+    font_path = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
+    font = bpy.data.fonts.load(font_path) if os.path.exists(font_path) else None
+
+    def finish(ob):
+        ob.data.materials.append(mat)
+        ob.parent = rig
+        ob.visible_shadow = False
+        bpy.context.scene.collection.objects.link(ob)
+
+    def bar(name, x0, x1, z0, z1):
+        """Quad in the rig's XZ plane (facing the camera)."""
+        me = bpy.data.meshes.new(name)
+        me.from_pydata([(x0, 0, z0), (x1, 0, z0), (x1, 0, z1), (x0, 0, z1)], [], [(0, 1, 2, 3)])
+        finish(bpy.data.objects.new(name, me))
+
+    def label(name, text, x, z, size, align="LEFT"):
+        cu = bpy.data.curves.new(name, "FONT")
+        cu.body, cu.size, cu.align_x, cu.align_y = text, size, align, "CENTER"
+        if font is not None:
+            cu.font = font
+        ob = bpy.data.objects.new(name, cu)
+        ob.location = (x, 0.0, z)
+        ob.rotation_euler = (math.pi / 2, 0.0, 0.0)  # stand up in XZ, facing -Y (the camera)
+        finish(ob)
+
+    if kind == "ruler":
+        depth, x = 0.0, -0.55
+        bar("ruler_spine", x - 0.002, x + 0.002, 0.70, 1.05)
+        for i in range(8):
+            z = 0.70 + 0.05 * i
+            major = i in (2, 4, 6)
+            bar(f"tick_{i}", x, x + (0.045 if major else 0.025), z - 0.0015, z + 0.0015)
+            if major:
+                label(f"lbl_{i}", f"{z:.1f} m", x - 0.015, z, 0.032, "RIGHT")
+        label("ruler_title", "hip height", x, 1.085, 0.03, "CENTER")
+    else:
+        depth = 0.35
+        for name, z, text in (
+            ("short", HIP_SHORT, "hip height · shortest legs (5 / 5 mm)"),
+            ("long", HIP_LONG, "hip height · longest legs (95 / 95 mm)"),
+        ):
+            bar(f"line_{name}", -1.05, 1.05, z - 0.0015, z + 0.0015)
+            label(f"lbl_{name}", text, -1.05, z + 0.03, 0.042)
+    # follow the robot horizontally; face the camera (local x = camera right); ``depth`` behind the robot
+    fwd = np.column_stack([-np.cos(az), -np.sin(az)])
+    loc = np.column_stack([track[:, :2] + depth * fwd, np.zeros(len(track))])
+    rot = np.column_stack([np.zeros(len(az)), np.zeros(len(az)), az + math.pi / 2])
+    bake_channels(rig, frames, {"location": loc, "rotation_euler": rot})
 
 
 def build_camera(cam_pos: np.ndarray, target: np.ndarray, frames: np.ndarray, lens: float = 50.0):
@@ -463,8 +547,10 @@ def main():
         track = np.column_stack([root[frames, 0, :2], np.zeros(len(frames))])
     else:
         setup_render(args)
-        cam_pos, target, track = camera_path(args.mode, data, frames, dt)
+        cam_pos, target, track, az = camera_path(args.mode, data, frames, dt)
         cam = build_camera(cam_pos, target, frames)
+        if args.mode == "hero" and args.height_ref != "none":
+            build_height_ref(args.height_ref, track, az, frames)
     build_light_rig(track, frames)
 
     sc.frame_start, sc.frame_end = first, last
